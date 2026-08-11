@@ -308,7 +308,7 @@ fn manual_provider_save_upserts_same_url_and_key_but_keeps_different_keys() {
 }
 
 #[test]
-fn imported_provider_merge_preserves_existing_local_profile_and_toml() {
+fn imported_provider_merge_keeps_local_id_and_applies_complete_source() {
     let conn = provider_test_connection();
     let local_toml = r#"model_provider = "custom"
 model = "local-model"
@@ -327,23 +327,42 @@ experimental_bearer_token = "sk-same"
     .expect("normalize local");
     upsert_provider_on_connection(&conn, local, ProviderUpsertMode::Manual).expect("save local");
 
-    let imported = normalize_saved_provider(provider_fixture(
+    let imported_toml = r#"# authoritative cc-switch template
+model_provider = "custom"
+model = "cc-model"
+service_tier = "priority"
+
+[model_providers.custom]
+name = "CC Name"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+
+[projects."/work/project"]
+trust_level = "trusted"
+"#;
+    let mut imported_fixture = provider_fixture(
         "cc-switch-id",
         "CC Name",
         "https://EXAMPLE.com:443/v1/",
         Some("sk-same"),
         "cc-model",
-        None,
-    ))
-    .expect("normalize import");
+        Some(imported_toml),
+    );
+    imported_fixture.requires_openai_auth = false;
+    let imported = normalize_saved_provider(imported_fixture).expect("normalize import");
     let result = upsert_ccswitch_provider_on_connection(&conn, imported.clone(), "cc-switch-id")
         .expect("merge import");
     assert_eq!(result.kind, ProviderUpsertKind::Merged);
     assert_eq!(result.provider.id, "local");
-    assert_eq!(result.provider.provider_name, "Local Name");
-    assert_eq!(result.provider.model, "local-model");
+    assert_eq!(result.provider.provider_name, "CC Name");
+    assert_eq!(result.provider.model, "cc-model");
+    assert!(!result.provider.requires_openai_auth);
     let normalized_toml = result.provider.toml_config.as_deref().unwrap();
-    assert!(normalized_toml.contains("name = \"Local Name\""));
+    assert!(normalized_toml.contains("# authoritative cc-switch template"));
+    assert!(normalized_toml.contains("name = \"CC Name\""));
+    assert!(normalized_toml.contains("service_tier = \"priority\""));
+    assert!(normalized_toml.contains("[projects.\"/work/project\"]"));
     assert!(normalized_toml.contains("wire_api = \"responses\""));
     assert!(!normalized_toml.contains("experimental_bearer_token"));
     assert_eq!(list_saved_providers_on_connection(&conn).unwrap().len(), 1);
@@ -1507,7 +1526,7 @@ description: Keep long investigations aligned.
 }
 
 #[test]
-fn switch_provider_round_trip_rewrites_proxy_auth_and_restores_official_auth() {
+fn switch_provider_round_trip_preserves_chatgpt_auth_and_scopes_provider_key() {
     let codex_dir = temp_codex_dir("switch-provider");
     let official_auth = json!({
         "OPENAI_API_KEY": null,
@@ -1518,6 +1537,7 @@ fn switch_provider_round_trip_rewrites_proxy_auth_and_restores_official_auth() {
         "last_refresh": "2026-07-24T00:00:00Z"
     });
     write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
+    let official_auth_bytes = fs::read(auth_path(&codex_dir)).expect("snapshot official auth");
     let switch_to_magic = || {
         switch_provider_inner(ProviderInput {
             config_dir: Some(codex_dir.display().to_string()),
@@ -1546,15 +1566,15 @@ fn switch_provider_round_trip_rewrites_proxy_auth_and_restores_official_auth() {
         .parse::<DocumentMut>()
         .expect("parse switched config");
     assert!(config_doc.get("experimental_bearer_token").is_none());
-    assert!(config_doc["model_providers"]["custom"]
-        .get("experimental_bearer_token")
-        .is_none());
+    assert_eq!(
+        config_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-test")
+    );
 
-    let live_auth: Value = serde_json::from_str(
-        &fs::read_to_string(auth_path(&codex_dir)).expect("read provider auth after switch"),
-    )
-    .expect("parse provider auth");
-    assert_eq!(live_auth, json!({"OPENAI_API_KEY": "sk-test"}));
+    assert_eq!(
+        fs::read(auth_path(&codex_dir)).expect("read auth after provider switch"),
+        official_auth_bytes
+    );
 
     let official = switch_official_provider_inner(Some(codex_dir.display().to_string()))
         .expect("switch back to official");
@@ -1582,12 +1602,14 @@ fn switch_provider_round_trip_rewrites_proxy_auth_and_restores_official_auth() {
         final_doc["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
         Some(true)
     );
-    assert!(!final_config.contains("experimental_bearer_token"));
-    let final_auth: Value = serde_json::from_str(
-        &fs::read_to_string(auth_path(&codex_dir)).expect("read final provider auth"),
-    )
-    .expect("parse final provider auth");
-    assert_eq!(final_auth, json!({"OPENAI_API_KEY": "sk-test"}));
+    assert_eq!(
+        final_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-test")
+    );
+    assert_eq!(
+        fs::read(auth_path(&codex_dir)).expect("read final provider auth"),
+        official_auth_bytes
+    );
 
     let snapshot_path = providers::official_snapshot_path_for_test(&codex_dir)
         .expect("resolve official snapshot path");
@@ -1649,7 +1671,68 @@ fn switch_provider_round_trip_restores_official_api_key() {
 }
 
 #[test]
-fn switch_provider_pre_switch_hook_observes_current_before_replacing_auth() {
+fn polluted_official_live_api_key_does_not_replace_saved_oauth() {
+    let codex_dir = temp_codex_dir("polluted-official-live-auth");
+    write_text(
+        &config_path(&codex_dir),
+        "model_provider = \"openai\"\nmodel = \"official-model\"\n",
+    )
+    .expect("write official config");
+    let official_auth = json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": "official-access-token",
+            "refresh_token": "official-refresh-token"
+        }
+    });
+    write_json(&auth_path(&codex_dir), &official_auth).expect("write official OAuth");
+    assert!(
+        providers::capture_live_chatgpt_config(&codex_dir).expect("capture trusted OAuth snapshot")
+    );
+
+    // Older Codex-X builds could leave this mixed state after a switch.
+    write_json(
+        &auth_path(&codex_dir),
+        &json!({"OPENAI_API_KEY": "sk-stale-proxy", "auth_mode": "apikey"}),
+    )
+    .expect("pollute live official auth");
+
+    switch_provider_inner(ProviderInput {
+        config_dir: Some(codex_dir.display().to_string()),
+        provider_id: Some("proxy".to_string()),
+        provider_name: "Proxy".to_string(),
+        base_url: "https://proxy.example.com/v1".to_string(),
+        model: "proxy-model".to_string(),
+        api_key: Some("sk-proxy".to_string()),
+        wire_api: Some("responses".to_string()),
+        requires_openai_auth: Some(true),
+    })
+    .expect("switch away from polluted official state");
+
+    switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("restore the trusted OAuth snapshot");
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &fs::read_to_string(auth_path(&codex_dir)).expect("read restored OAuth")
+        )
+        .expect("parse restored OAuth"),
+        official_auth
+    );
+
+    let snapshot_path = providers::official_snapshot_path_for_test(&codex_dir)
+        .expect("resolve official snapshot path");
+    let snapshot: Value = serde_json::from_str(
+        &fs::read_to_string(&snapshot_path).expect("read repaired official snapshot"),
+    )
+    .expect("parse repaired official snapshot");
+    assert_eq!(snapshot["auth"], official_auth);
+
+    let _ = fs::remove_file(snapshot_path);
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn switch_provider_pre_switch_hook_observes_current_before_scoping_next_key() {
     let codex_dir = temp_codex_dir("switch-provider-persist-current");
     write_text(
         &config_path(&codex_dir),
@@ -1669,14 +1752,11 @@ command = "docs-server"
 "#,
     )
     .expect("write provider A config");
-    write_json(
-        &auth_path(&codex_dir),
-        &json!({
-            "auth_mode": "chatgpt",
-            "tokens": {"access_token": "official-access-token"}
-        }),
-    )
-    .expect("write official auth");
+    let official_auth = json!({
+        "auth_mode": "chatgpt",
+        "tokens": {"access_token": "official-access-token"}
+    });
+    write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
 
     let persisted = std::cell::RefCell::new(None);
     let result = switch_provider_with_pre_persist(
@@ -1730,11 +1810,16 @@ command = "docs-server"
         &fs::read_to_string(auth_path(&codex_dir)).expect("read provider B auth"),
     )
     .expect("parse provider B auth");
-    assert_eq!(live_auth, json!({"OPENAI_API_KEY": "sk-b"}));
-    assert!(!result
+    assert_eq!(live_auth, official_auth);
+    let live_doc = result
         .state
         .config_text
-        .contains("experimental_bearer_token"));
+        .parse::<DocumentMut>()
+        .expect("parse provider B live config");
+    assert_eq!(
+        live_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-b")
+    );
 
     let _ = fs::remove_dir_all(codex_dir);
 }
@@ -1759,7 +1844,13 @@ fn switch_provider_reserved_builtin_ids_still_write_live_custom() {
     assert!(config_text.contains("model_provider = \"custom\""));
     assert!(config_text.contains("[model_providers.custom]"));
     assert!(!config_text.contains("[model_providers.openai]"));
-    assert!(!config_text.contains("experimental_bearer_token"));
+    let config_doc = config_text
+        .parse::<DocumentMut>()
+        .expect("parse reserved-id provider config");
+    assert_eq!(
+        config_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-proxy")
+    );
     let provider_auth: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read provider auth"),
     )
@@ -2073,6 +2164,43 @@ requires_openai_auth = true
 }
 
 #[test]
+fn complete_official_toml_model_is_authoritative() {
+    let codex_dir = temp_codex_dir("official-toml-model-authority");
+    let official_config = r#"model_provider = "openai"
+model = "toml-model"
+model_reasoning_effort = "xhigh"
+
+[features]
+js_repl = false
+"#;
+    let result = save_official_config_inner(
+        Some(codex_dir.display().to_string()),
+        Some("stale-form-model".to_string()),
+        Some(
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "official-access-token"}
+            })
+            .to_string(),
+        ),
+        Some(official_config.to_string()),
+    )
+    .expect("save complete official TOML");
+
+    assert_eq!(result.state.model.as_deref(), Some("toml-model"));
+    let saved = fs::read_to_string(config_path(&codex_dir)).expect("read saved official TOML");
+    assert!(saved.contains("model = \"toml-model\""));
+    assert!(!saved.contains("stale-form-model"));
+    assert!(saved.contains("model_reasoning_effort = \"xhigh\""));
+    assert!(saved.contains("[features]"));
+
+    let snapshot_path = providers::official_snapshot_path_for_test(&codex_dir)
+        .expect("resolve official snapshot path");
+    let _ = fs::remove_file(snapshot_path);
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
 fn complete_official_config_round_trips_with_auth_snapshot() {
     let codex_dir = temp_codex_dir("complete-official-config-round-trip");
     let proxy_config = r#"model_provider = "custom"
@@ -2087,19 +2215,36 @@ requires_openai_auth = true
     let official_config = r#"# keep-official-comment
 model_provider = "openai"
 model = "official-model"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
 approval_policy = "on-request"
+notify = ["C:\\Tools\\codex-notify.exe", "turn-ended"]
 
 [desktop]
 localeOverride = "zh-CN"
+integratedTerminalShell = "gitBash"
+
+[windows]
+sandbox = "elevated"
+shell_path = 'D:\Tools\PowerShell\pwsh.exe'
 
 [features]
 js_repl = false
 
-[projects."/official/project"]
+[projects.'C:\Users\Tester\Documents\Codex\official-project']
 trust_level = "trusted"
 
 [plugins."browser@openai-bundled"]
 enabled = true
+
+[marketplaces.openai-bundled]
+last_updated = "2026-08-11T04:59:25Z"
+source_type = "local"
+source = '\\?\C:\Users\Tester\.codex\.tmp\bundled-marketplaces\openai-bundled'
+
+[shell_environment_policy.set]
+BROWSER_USE_AVAILABLE_BACKENDS = "chrome,iab"
+CODEX_HOME = 'C:\Users\Tester\.codex'
 
 [mcp_servers.docs]
 command = "docs-server"
@@ -2138,9 +2283,12 @@ command = "docs-server"
     let restored = fs::read_to_string(config_path(&codex_dir)).expect("read official config");
     assert!(restored.contains("# keep-official-comment"));
     assert!(restored.contains("[desktop]"));
+    assert!(restored.contains("[windows]"));
     assert!(restored.contains("[features]"));
-    assert!(restored.contains("[projects.\"/official/project\"]"));
+    assert!(restored.contains("[projects.'C:\\Users\\Tester\\Documents\\Codex\\official-project']"));
     assert!(restored.contains("[plugins.\"browser@openai-bundled\"]"));
+    assert!(restored.contains("[marketplaces.openai-bundled]"));
+    assert!(restored.contains("[shell_environment_policy.set]"));
     assert!(restored.contains("[mcp_servers.docs]"));
     assert!(!restored.contains("proxy.example.com"));
     assert_eq!(
@@ -2169,6 +2317,109 @@ command = "docs-server"
         .as_str()
         .is_some_and(|text| text.contains("[desktop]")));
 
+    let switch_to_proxy = || {
+        switch_provider_inner(ProviderInput {
+            config_dir: Some(codex_dir.display().to_string()),
+            provider_id: Some("proxy".to_string()),
+            provider_name: "Proxy".to_string(),
+            base_url: "https://proxy.example.com/v1".to_string(),
+            model: "proxy-model".to_string(),
+            api_key: Some("sk-proxy".to_string()),
+            wire_api: Some("responses".to_string()),
+            requires_openai_auth: Some(true),
+        })
+    };
+    switch_to_proxy().expect("switch from complete official config to proxy");
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &fs::read_to_string(auth_path(&codex_dir)).expect("read preserved OAuth auth")
+        )
+        .expect("parse preserved OAuth auth"),
+        official_auth
+    );
+
+    switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("restore complete official config again");
+    let restored_again =
+        fs::read_to_string(config_path(&codex_dir)).expect("read official config again");
+    for expected in [
+        "notify =",
+        "[desktop]",
+        "localeOverride = \"zh-CN\"",
+        "[windows]",
+        "[features]",
+        "[plugins.\"browser@openai-bundled\"]",
+        "[marketplaces.openai-bundled]",
+        "[shell_environment_policy.set]",
+        "[mcp_servers.docs]",
+    ] {
+        assert!(restored_again.contains(expected), "missing {expected}");
+    }
+
+    switch_to_proxy().expect("switch to proxy after second official activation");
+    let final_proxy = fs::read_to_string(config_path(&codex_dir)).expect("read final proxy config");
+    let final_proxy = final_proxy
+        .parse::<DocumentMut>()
+        .expect("parse final proxy config");
+    assert_eq!(
+        final_proxy["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-proxy")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &fs::read_to_string(auth_path(&codex_dir)).expect("read final OAuth auth")
+        )
+        .expect("parse final OAuth auth"),
+        official_auth
+    );
+
+    let _ = fs::remove_file(snapshot_path);
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn complete_official_config_without_auth_survives_provider_round_trip() {
+    let codex_dir = temp_codex_dir("complete-official-config-without-auth");
+    let official_config = r#"model_provider = "openai"
+model = "official-model"
+notify = ["C:\\Tools\\notify.exe", "turn-ended"]
+
+[desktop]
+localeOverride = "zh-CN"
+
+[windows]
+sandbox = "elevated"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"#;
+    write_text(&config_path(&codex_dir), official_config).expect("write official config");
+
+    switch_provider_inner(ProviderInput {
+        config_dir: Some(codex_dir.display().to_string()),
+        provider_id: Some("proxy".to_string()),
+        provider_name: "Proxy".to_string(),
+        base_url: "https://proxy.example.com/v1".to_string(),
+        model: "proxy-model".to_string(),
+        api_key: Some("sk-proxy".to_string()),
+        wire_api: Some("responses".to_string()),
+        requires_openai_auth: Some(true),
+    })
+    .expect("switch to proxy without official auth");
+
+    switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("restore config-only official snapshot");
+    let restored = fs::read_to_string(config_path(&codex_dir)).expect("read restored config");
+    assert!(restored.contains("notify ="));
+    assert!(restored.contains("[desktop]"));
+    assert!(restored.contains("localeOverride = \"zh-CN\""));
+    assert!(restored.contains("[windows]"));
+    assert!(restored.contains("[plugins.\"browser@openai-bundled\"]"));
+    assert!(!restored.contains("proxy.example.com"));
+    assert!(!auth_path(&codex_dir).exists());
+
+    let snapshot_path = providers::official_snapshot_path_for_test(&codex_dir)
+        .expect("resolve config-only official snapshot path");
     let _ = fs::remove_file(snapshot_path);
     let _ = fs::remove_dir_all(codex_dir);
 }
@@ -2238,9 +2489,14 @@ requires_openai_auth = true
         .expect("parse restored provider auth"),
         json!({"OPENAI_API_KEY": "sk-auth-only"})
     );
-    assert!(!fs::read_to_string(config_path(&codex_dir))
+    let restored_provider = fs::read_to_string(config_path(&codex_dir))
         .expect("read restored provider config")
-        .contains("experimental_bearer_token"));
+        .parse::<DocumentMut>()
+        .expect("parse restored provider config");
+    assert_eq!(
+        restored_provider["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-auth-only")
+    );
 
     crate::providers::delete_provider_inner(&provider_id).expect("delete backfill test provider");
     let _ = fs::remove_dir_all(codex_dir);
@@ -2388,6 +2644,59 @@ experimental_bearer_token = "sk-proxy"
     assert_eq!(state["officialAuthAvailable"].as_bool(), Some(true));
     assert_eq!(state["isOfficialProvider"].as_bool(), Some(false));
 
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn malformed_official_snapshot_does_not_block_state_or_provider_switch() {
+    let codex_dir = temp_codex_dir("malformed-official-snapshot");
+    write_text(
+        &config_path(&codex_dir),
+        "model_provider = \"openai\"\nmodel = \"official-model\"\n",
+    )
+    .expect("write official config");
+    let official_auth = json!({
+        "auth_mode": "chatgpt",
+        "tokens": {"access_token": "official-access-token"}
+    });
+    write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
+    let snapshot_path = providers::official_snapshot_path_for_test(&codex_dir)
+        .expect("resolve official snapshot path");
+    fs::create_dir_all(snapshot_path.parent().expect("snapshot parent"))
+        .expect("create snapshot parent");
+    write_text(&snapshot_path, "{truncated-snapshot").expect("write malformed official snapshot");
+
+    let state = serde_json::to_value(build_state(codex_dir.clone()).expect("build state"))
+        .expect("serialize state");
+    assert_eq!(state["officialAuthAvailable"].as_bool(), Some(true));
+    assert_eq!(state["isOfficialProvider"].as_bool(), Some(true));
+
+    switch_provider_inner(ProviderInput {
+        config_dir: Some(codex_dir.display().to_string()),
+        provider_id: Some("proxy".to_string()),
+        provider_name: "Proxy".to_string(),
+        base_url: "https://proxy.example.com/v1".to_string(),
+        model: "proxy-model".to_string(),
+        api_key: Some("sk-proxy".to_string()),
+        wire_api: Some("responses".to_string()),
+        requires_openai_auth: Some(true),
+    })
+    .expect("switch provider and repair snapshot");
+
+    let repaired: Value = serde_json::from_str(
+        &fs::read_to_string(&snapshot_path).expect("read repaired official snapshot"),
+    )
+    .expect("parse repaired official snapshot");
+    assert_eq!(repaired["auth"], official_auth);
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &fs::read_to_string(auth_path(&codex_dir)).expect("read preserved live auth")
+        )
+        .expect("parse preserved live auth"),
+        official_auth
+    );
+
+    let _ = fs::remove_file(snapshot_path);
     let _ = fs::remove_dir_all(codex_dir);
 }
 
@@ -2784,7 +3093,15 @@ fn reset_then_new_live_oauth_is_detected_and_preserved() {
     let proxy_auth: Value =
         serde_json::from_str(&fs::read_to_string(auth_path(&codex_dir)).expect("read proxy auth"))
             .expect("parse proxy auth");
-    assert_eq!(proxy_auth, json!({"OPENAI_API_KEY": "sk-proxy"}));
+    assert_eq!(proxy_auth, fresh_oauth);
+    let proxy_config = fs::read_to_string(config_path(&codex_dir)).expect("read proxy config");
+    let proxy_config = proxy_config
+        .parse::<DocumentMut>()
+        .expect("parse proxy config");
+    assert_eq!(
+        proxy_config["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-proxy")
+    );
 
     switch_official_provider_with_pre_persist(Some(codex_dir.display().to_string()), |_| Ok(()))
         .expect("restore fresh official login after proxy");
@@ -2799,7 +3116,7 @@ fn reset_then_new_live_oauth_is_detected_and_preserved() {
         &fs::read_to_string(auth_path(&codex_dir)).expect("read final proxy auth"),
     )
     .expect("parse final proxy auth");
-    assert_eq!(final_proxy_auth, json!({"OPENAI_API_KEY": "sk-proxy"}));
+    assert_eq!(final_proxy_auth, fresh_oauth);
 
     let snapshot_path =
         providers::official_snapshot_path_for_test(&codex_dir).expect("resolve snapshot path");
@@ -3024,7 +3341,7 @@ requires_openai_auth = true
 }
 
 #[test]
-fn save_provider_toml_config_moves_key_to_auth_and_restores_official_snapshot() {
+fn save_provider_toml_config_preserves_chatgpt_auth_and_scopes_provider_key() {
     let codex_dir = temp_codex_dir("save-provider-toml-token");
     let official_auth = json!({
         "auth_mode": "chatgpt",
@@ -3053,12 +3370,18 @@ requires_openai_auth = false
     assert!(config_text.contains("model_provider = \"custom\""));
     assert!(config_text.contains("[model_providers.custom]"));
     assert!(!config_text.contains("[model_providers.proxy]"));
-    assert!(!config_text.contains("experimental_bearer_token"));
+    let config_doc = config_text
+        .parse::<DocumentMut>()
+        .expect("parse provider config");
+    assert_eq!(
+        config_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-provider-table")
+    );
     let auth_after: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read auth after save"),
     )
     .expect("parse auth after save");
-    assert_eq!(auth_after, json!({"OPENAI_API_KEY": "sk-provider-table"}));
+    assert_eq!(auth_after, official_auth);
 
     switch_official_provider_inner(Some(codex_dir.display().to_string()))
         .expect("restore official auth after TOML provider switch");
@@ -3209,7 +3532,10 @@ command = "must-not-replace-live"
         doc["model_providers"]["custom"]["base_url"].as_str(),
         Some("https://new.example.com/v1")
     );
-    assert!(!merged.contains("experimental_bearer_token"));
+    assert_eq!(
+        doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-new")
+    );
     let auth: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read merged provider auth"),
     )
@@ -3241,7 +3567,13 @@ experimental_bearer_token = "sk-existing"
 
     assert!(result.ok);
     let config = fs::read_to_string(config_path(&codex_dir)).expect("read live config");
-    assert!(!config.contains("experimental_bearer_token"));
+    let config = config
+        .parse::<DocumentMut>()
+        .expect("parse live provider config");
+    assert_eq!(
+        config["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-existing")
+    );
     let auth: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read migrated provider auth"),
     )
@@ -3301,10 +3633,15 @@ requires_openai_auth = false
         .state
         .config_text
         .contains("https://b.example.com/v1"));
-    assert!(!result
+    let live_doc = result
         .state
         .config_text
-        .contains("experimental_bearer_token"));
+        .parse::<DocumentMut>()
+        .expect("parse provider B live config");
+    assert_eq!(
+        live_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some("sk-b")
+    );
     assert!(!result
         .state
         .config_text

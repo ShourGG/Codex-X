@@ -1,6 +1,6 @@
 use crate::backups::{action_backup_root, BackupMeta};
 use crate::error::{CodexxError, Result};
-use crate::file_io::{ensure_directory, io_err, json_err, parse_toml_document, write_private_json};
+use crate::file_io::{ensure_directory, io_err, parse_toml_document, write_private_json};
 use crate::paths::app_home;
 use crate::toml_utils::ensure_table;
 use crate::{auth_path, config_path, string_value};
@@ -85,7 +85,7 @@ pub(crate) fn auth_value_has_material(value: &Value) -> bool {
     })
 }
 
-fn is_chatgpt_auth(value: &Value) -> bool {
+pub(crate) fn is_chatgpt_auth(value: &Value) -> bool {
     // Older Codex releases wrote OAuth tokens without auth_mode. Accept that
     // unambiguous legacy shape, but reject any explicitly non-ChatGPT mode.
     let chatgpt_mode = match value.get("auth_mode") {
@@ -218,8 +218,12 @@ pub(crate) fn validate_official_config_text(
         ));
     }
     remove_bearer_tokens(&mut doc);
-    if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
-        doc["model"] = value(model);
+    // A supplied complete TOML document is authoritative. The separate model
+    // field only fills a missing value for compatibility with older clients.
+    if string_value(&doc, "model").is_none() {
+        if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
+            doc["model"] = value(model);
+        }
     }
     let text = doc.to_string();
     let model = string_value(&doc, "model");
@@ -316,16 +320,54 @@ pub(crate) fn mark_official_config_reset(
 pub(crate) fn capture_live_official_config_before_provider_switch(
     codex_dir: &Path,
 ) -> Result<bool> {
-    capture_live_official_auth(codex_dir, |auth| {
-        is_chatgpt_auth(auth) || has_openai_api_key(auth)
-    })
+    if !live_config_is_official(codex_dir)? {
+        return Ok(false);
+    }
+
+    let live_config = live_official_config_text(codex_dir)?;
+    let live_model = live_config
+        .as_deref()
+        .map(|text| model_from_config(&config_path(codex_dir), text))
+        .transpose()?
+        .flatten();
+    let has_explicit_official_route = live_config
+        .as_deref()
+        .map(|text| {
+            let doc = parse_toml_document(&config_path(codex_dir), text)?;
+            Ok::<_, CodexxError>(string_value(&doc, "model_provider").is_some())
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let live_auth = read_auth_value(&auth_path(codex_dir))?.filter(|auth| {
+        is_chatgpt_auth(auth) || (has_explicit_official_route && has_openai_api_key(auth))
+    });
+
+    let previous = match load_snapshot(codex_dir)? {
+        SnapshotState::Ready(candidate) | SnapshotState::Reset(candidate) => Some(candidate),
+        SnapshotState::Missing => None,
+    };
+    let config = live_config.or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|candidate| candidate.config_text.clone())
+    });
+    let model = live_model.or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|candidate| candidate.model.clone())
+    });
+    let previous_auth = previous
+        .as_ref()
+        .and_then(|candidate| candidate.auth.clone());
+    let auth = prefer_chatgpt_auth(live_auth, previous_auth);
+    if config.is_none() && auth.is_none() {
+        return Ok(false);
+    }
+    write_snapshot(codex_dir, config, model, auth)?;
+    Ok(true)
 }
 
 #[cfg(test)]
-pub(crate) fn capture_live_chatgpt_config(codex_dir: &Path) -> Result<bool> {
-    capture_live_official_auth(codex_dir, is_chatgpt_auth)
-}
-
 fn capture_live_official_auth(
     codex_dir: &Path,
     is_trusted: impl FnOnce(&Value) -> bool,
@@ -349,15 +391,35 @@ fn capture_live_official_auth(
     Ok(true)
 }
 
+#[cfg(test)]
+pub(crate) fn capture_live_chatgpt_config(codex_dir: &Path) -> Result<bool> {
+    capture_live_official_auth(codex_dir, is_chatgpt_auth)
+}
+
 fn load_snapshot(codex_dir: &Path) -> Result<SnapshotState> {
     let path = official_snapshot_path(codex_dir)?;
     if !path.is_file() {
         return Ok(SnapshotState::Missing);
     }
     let text = fs::read_to_string(&path).map_err(|error| io_err(&path, error))?;
-    let snapshot: OfficialConfigSnapshot =
-        serde_json::from_str(&text).map_err(|error| json_err(&path, error))?;
-    snapshot_state(codex_dir, &path, snapshot)
+    let snapshot: OfficialConfigSnapshot = match serde_json::from_str(&text) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return Ok(SnapshotState::Missing),
+    };
+    // This is an app-owned recovery cache, not the live source of truth. A
+    // truncated, stale, or incompatible cache must never block startup or a
+    // provider switch; valid live auth/history can repair it on the next write.
+    Ok(snapshot_state(codex_dir, &path, snapshot).unwrap_or(SnapshotState::Missing))
+}
+
+fn prefer_chatgpt_auth(primary: Option<Value>, fallback: Option<Value>) -> Option<Value> {
+    if primary.as_ref().is_some_and(is_chatgpt_auth) {
+        return primary;
+    }
+    if fallback.as_ref().is_some_and(is_chatgpt_auth) {
+        return fallback;
+    }
+    primary.or(fallback)
 }
 
 fn snapshot_state(
@@ -555,6 +617,20 @@ pub(crate) fn official_config_candidate(
 ) -> Result<Option<OfficialConfigCandidate>> {
     match load_snapshot(codex_dir)? {
         SnapshotState::Ready(candidate) => {
+            // A third-party route may deliberately keep the user's ChatGPT
+            // login in auth.json and carry its own key in
+            // experimental_bearer_token. Prefer that live OAuth value so a
+            // token refresh during proxy use is not replaced by an older
+            // official snapshot when switching back.
+            if let Some(live) = live_chatgpt_candidate(codex_dir)? {
+                return complete_candidate_config(codex_dir, live, Some(&candidate)).map(Some);
+            }
+            // Never let an API-key-only live file silently downgrade a trusted
+            // OAuth snapshot. Older Codex-X builds could leave exactly that
+            // polluted state while config.toml already pointed at OpenAI.
+            if candidate.auth.as_ref().is_some_and(is_chatgpt_auth) {
+                return complete_candidate_config(codex_dir, candidate, None).map(Some);
+            }
             if let Some(live) = live_official_auth_candidate(codex_dir)? {
                 return complete_candidate_config(codex_dir, live, Some(&candidate)).map(Some);
             }
@@ -564,10 +640,16 @@ pub(crate) fn official_config_candidate(
             if let Some(live) = live_official_auth_candidate(codex_dir)? {
                 return complete_candidate_config(codex_dir, live, Some(&reset)).map(Some);
             }
+            if let Some(live) = live_chatgpt_candidate(codex_dir)? {
+                return complete_candidate_config(codex_dir, live, Some(&reset)).map(Some);
+            }
             return complete_candidate_config(codex_dir, reset, None).map(Some);
         }
         SnapshotState::Reset(reset) => {
             if let Some(live) = live_official_auth_candidate(codex_dir)? {
+                return complete_candidate_config(codex_dir, live, Some(&reset)).map(Some);
+            }
+            if let Some(live) = live_chatgpt_candidate(codex_dir)? {
                 return complete_candidate_config(codex_dir, live, Some(&reset)).map(Some);
             }
             if let Some(mut backup) = latest_official_backup(codex_dir)? {

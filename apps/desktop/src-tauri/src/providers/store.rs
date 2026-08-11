@@ -431,48 +431,36 @@ fn unique_provider_id_on_connection(conn: &Connection, preferred: &str) -> Resul
     }
 }
 
-fn preserve_existing_provider_config(
+fn merge_authoritative_import(
     mut incoming: SavedProvider,
     existing: &SavedProvider,
 ) -> SavedProvider {
     incoming.id = existing.id.clone();
-    if !existing.provider_name.trim().is_empty() {
+    if incoming.provider_name.trim().is_empty() {
         incoming.provider_name = existing.provider_name.clone();
     }
-    if !existing.base_url.trim().is_empty() {
+    if incoming.base_url.trim().is_empty() {
         incoming.base_url = existing.base_url.clone();
     }
-    if !existing.model.trim().is_empty() {
+    if incoming.model.trim().is_empty() {
         incoming.model = existing.model.clone();
     }
-    if existing
+    if incoming
         .api_key
         .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
+        .is_none_or(|value| value.trim().is_empty())
     {
         incoming.api_key = existing.api_key.clone();
     }
-    if existing
+    if incoming
         .toml_config
         .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
+        .is_none_or(|value| value.trim().is_empty())
     {
         incoming.toml_config = existing.toml_config.clone();
     }
-    if !existing.wire_api.trim().is_empty() {
+    if incoming.wire_api.trim().is_empty() {
         incoming.wire_api = existing.wire_api.clone();
-    }
-    incoming.requires_openai_auth = existing.requires_openai_auth;
-    incoming
-}
-
-fn update_stable_import(mut incoming: SavedProvider, existing: &SavedProvider) -> SavedProvider {
-    incoming.id = existing.id.clone();
-    if incoming.api_key.is_none() {
-        incoming.api_key = existing.api_key.clone();
-    }
-    if incoming.toml_config.is_none() {
-        incoming.toml_config = existing.toml_config.clone();
     }
     incoming
 }
@@ -563,7 +551,7 @@ fn upsert_provider_in_savepoint(
             .or(identity_match)
             .or(compatible_match),
     };
-    let preserves_local_profile = mode == ProviderUpsertMode::Imported
+    let preserves_local_id = mode == ProviderUpsertMode::Imported
         && target.is_some_and(|candidate| {
             candidate.source == MANUAL_PROVIDER_SOURCE
                 || candidate.source == CCSWITCH_LOCAL_PROVIDER_SOURCE
@@ -572,12 +560,8 @@ fn upsert_provider_in_savepoint(
         let existing = &target.provider;
         let same_id = existing.id == requested_id;
         provider.id = existing.id.clone();
-        if preserves_local_profile {
-            provider = preserve_existing_provider_config(provider, existing);
-        } else if source_match.is_some_and(|candidate| candidate.provider.id == existing.id) {
-            provider = update_stable_import(provider, existing);
-        } else if mode != ProviderUpsertMode::Manual {
-            provider = preserve_existing_provider_config(provider, existing);
+        if mode == ProviderUpsertMode::Imported {
+            provider = merge_authoritative_import(provider, existing);
         }
         if import_rehome_target.is_some() {
             ProviderUpsertKind::Merged
@@ -600,7 +584,7 @@ fn upsert_provider_in_savepoint(
         }
     }
     let write_origin = match origin {
-        Some((CCSWITCH_PROVIDER_SOURCE, source_id)) if preserves_local_profile => {
+        Some((CCSWITCH_PROVIDER_SOURCE, source_id)) if preserves_local_id => {
             Some((CCSWITCH_LOCAL_PROVIDER_SOURCE, source_id))
         }
         _ => origin,
@@ -1214,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_import_collision_keeps_manual_record_and_rehomes_source_identity() {
+    fn stable_import_collision_keeps_manual_id_and_applies_source_values() {
         let conn = test_connection();
         let mut imported = provider("cc-old", "Imported old", Some("sk-old"));
         imported.base_url = "https://old.example.com/v1".to_string();
@@ -1236,8 +1220,8 @@ mod tests {
 
         assert_eq!(result.kind, ProviderUpsertKind::Merged);
         assert_eq!(result.provider.id, "manual-local");
-        assert_eq!(result.provider.provider_name, "Locally edited");
-        assert_eq!(result.provider.model, "local-model");
+        assert_eq!(result.provider.provider_name, "Imported changed");
+        assert_eq!(result.provider.model, "remote-model");
         assert_eq!(
             result.provider.toml_config.as_deref(),
             Some("model = \"local-model\"")
@@ -1249,28 +1233,36 @@ mod tests {
     }
 
     #[test]
-    fn ccswitch_import_preserves_an_intentional_minimal_manual_template() {
+    fn ccswitch_import_replaces_stale_local_values_with_complete_source() {
         let conn = test_connection();
-        let mut manual = provider("legacy-local", "Local name", Some("sk-shared"));
-        manual.model = "local-model".to_string();
-        manual.toml_config = Some(
+        let mut stale = provider("legacy-local", "Local name", Some("sk-local"));
+        stale.base_url = "https://old.example.com/v1".to_string();
+        stale.model = "local-model".to_string();
+        stale.toml_config = Some(
             r#"model_provider = "custom"
 model = "local-model"
 
 [model_providers.custom]
 name = "Local name"
-base_url = "https://example.com/v1"
-wire_api = "responses"
+base_url = "https://old.example.com/v1"
+wire_api = "chat"
 requires_openai_auth = true
 request_max_retries = 3
 "#
             .to_string(),
         );
-        upsert_provider_on_connection(&conn, manual, ProviderUpsertMode::Manual)
-            .expect("seed intentional minimal provider");
+        stale.wire_api = "chat".to_string();
+        write_provider_with_origin(
+            &conn,
+            &stale,
+            Some((CCSWITCH_LOCAL_PROVIDER_SOURCE, "cc-row")),
+        )
+        .expect("seed stale local import");
 
-        let mut imported = provider("cc-row", "CC name", Some("sk-shared"));
+        let mut imported = provider("cc-row", "CC name", Some("sk-imported"));
+        imported.base_url = "https://new.example.com/v1".to_string();
         imported.model = "remote-model".to_string();
+        imported.requires_openai_auth = false;
         imported.toml_config = Some(
             r#"# complete cc-switch template
 model_provider = "custom"
@@ -1279,7 +1271,7 @@ service_tier = "priority"
 
 [model_providers.custom]
 name = "CC name"
-base_url = "https://example.com/v1"
+base_url = "https://new.example.com/v1"
 wire_api = "responses"
 requires_openai_auth = false
 request_max_retries = 7
@@ -1293,71 +1285,87 @@ enabled = true
             .to_string(),
         );
         let result = upsert_ccswitch_provider_on_connection(&conn, imported, "cc-row")
-            .expect("merge cc-switch source without replacing the manual template");
+            .expect("replace stale local values from the authoritative cc-switch row");
 
-        assert_eq!(result.kind, ProviderUpsertKind::Merged);
+        assert_eq!(result.kind, ProviderUpsertKind::Updated);
         assert_eq!(result.provider.id, "legacy-local");
-        assert_eq!(result.provider.provider_name, "Local name");
-        assert_eq!(result.provider.model, "local-model");
+        assert_eq!(result.provider.provider_name, "CC name");
+        assert_eq!(result.provider.base_url, "https://new.example.com/v1");
+        assert_eq!(result.provider.model, "remote-model");
+        assert_eq!(result.provider.api_key.as_deref(), Some("sk-imported"));
+        assert_eq!(result.provider.wire_api, "responses");
+        assert!(!result.provider.requires_openai_auth);
         let template = result
             .provider
             .toml_config
-            .expect("preserved manual provider template");
+            .expect("complete cc-switch template");
         let doc = template
             .parse::<DocumentMut>()
-            .expect("parse preserved provider template");
-        assert!(!template.contains("# complete cc-switch template"));
-        assert!(doc.get("service_tier").is_none());
-        assert!(doc.get("projects").is_none());
-        assert!(doc.get("plugins").is_none());
-        assert_eq!(doc["model"].as_str(), Some("local-model"));
+            .expect("parse imported provider template");
+        assert!(template.contains("# complete cc-switch template"));
+        assert_eq!(doc["service_tier"].as_str(), Some("priority"));
+        assert_eq!(doc["model"].as_str(), Some("remote-model"));
         assert_eq!(
             doc["model_providers"]["custom"]["name"].as_str(),
-            Some("Local name")
+            Some("CC name")
         );
         assert_eq!(
             doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
-            Some(3)
+            Some(7)
         );
-
-        let mut repeated = provider("cc-row", "CC renamed", Some("sk-shared"));
-        repeated.model = "new-remote-model".to_string();
-        repeated.toml_config = Some(
-            r#"model_provider = "custom"
-model = "new-remote-model"
-service_tier = "flex"
-
-[model_providers.custom]
-name = "CC renamed"
-base_url = "https://example.com/v1"
-wire_api = "responses"
-requires_openai_auth = false
-
-[projects."/remote/replacement"]
-trust_level = "untrusted"
-"#
-            .to_string(),
-        );
-        let repeated = upsert_ccswitch_provider_on_connection(&conn, repeated, "cc-row")
-            .expect("repeat cc-switch import without replacing local profile");
-        assert_eq!(repeated.provider.id, "legacy-local");
-        assert_eq!(repeated.provider.provider_name, "Local name");
-        assert_eq!(repeated.provider.model, "local-model");
-        let repeated_template = repeated.provider.toml_config.expect("keep local template");
-        let repeated_doc = repeated_template
-            .parse::<DocumentMut>()
-            .expect("parse repeated import template");
-        assert!(repeated_doc.get("service_tier").is_none());
-        assert!(repeated_doc.get("projects").is_none());
-        assert!(repeated_doc.get("plugins").is_none());
         assert_eq!(
-            repeated_doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
-            Some(3)
+            doc["projects"]["/work/project"]["trust_level"].as_str(),
+            Some("trusted")
         );
-        let rows = stored_providers_on_connection(&conn).expect("read repeated import row");
+        assert_eq!(
+            doc["plugins"]["browser@openai-bundled"]["enabled"].as_bool(),
+            Some(true)
+        );
+        let rows = stored_providers_on_connection(&conn).expect("read imported row");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source, CCSWITCH_LOCAL_PROVIDER_SOURCE);
         assert_eq!(rows[0].source_id.as_deref(), Some("cc-row"));
+    }
+
+    #[test]
+    fn ccswitch_import_falls_back_only_when_source_fields_are_missing() {
+        let conn = test_connection();
+        let mut existing = provider("local-id", "Existing name", Some("sk-existing"));
+        existing.base_url = "https://existing.example.com/v1".to_string();
+        existing.model = "existing-model".to_string();
+        existing.toml_config = Some("model = \"existing-model\"".to_string());
+        existing.wire_api = "responses".to_string();
+        write_provider_with_origin(
+            &conn,
+            &existing,
+            Some((CCSWITCH_LOCAL_PROVIDER_SOURCE, "cc-row")),
+        )
+        .expect("seed existing source row");
+
+        let missing = SavedProvider {
+            id: "remote-id".to_string(),
+            provider_name: " ".to_string(),
+            base_url: String::new(),
+            model: "\t".to_string(),
+            api_key: Some(" ".to_string()),
+            toml_config: Some("\n".to_string()),
+            wire_api: String::new(),
+            requires_openai_auth: false,
+        };
+        let result = upsert_ccswitch_provider_on_connection(&conn, missing, "cc-row")
+            .expect("fill missing import fields from the existing source row");
+
+        assert_eq!(result.provider.id, "local-id");
+        assert_eq!(result.provider.provider_name, "Existing name");
+        assert_eq!(result.provider.base_url, "https://existing.example.com/v1");
+        assert_eq!(result.provider.model, "existing-model");
+        assert_eq!(result.provider.api_key.as_deref(), Some("sk-existing"));
+        assert_eq!(
+            result.provider.toml_config.as_deref(),
+            Some("model = \"existing-model\"")
+        );
+        assert_eq!(result.provider.wire_api, "responses");
+        assert!(!result.provider.requires_openai_auth);
     }
 
     #[test]
@@ -1405,7 +1413,7 @@ trust_level = "untrusted"
     }
 
     #[test]
-    fn legacy_consolidation_keeps_the_local_profile_across_the_next_import() {
+    fn legacy_consolidation_keeps_local_id_but_next_import_is_authoritative() {
         let conn = test_connection();
         let mut imported = provider("imported-old", "Imported old", Some("sk-same"));
         imported.model = "old-model".to_string();
@@ -1448,11 +1456,11 @@ trust_level = "untrusted"
         let rows = stored_providers_on_connection(&conn).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].provider.id, "manual-local");
-        assert_eq!(rows[0].provider.provider_name, "Edited locally");
-        assert_eq!(rows[0].provider.model, "latest-model");
+        assert_eq!(rows[0].provider.provider_name, "Remote replacement");
+        assert_eq!(rows[0].provider.model, "remote-model");
         assert_eq!(
             rows[0].provider.toml_config.as_deref(),
-            Some("model = \"latest-model\"")
+            Some("model = \"remote-model\"")
         );
         assert_eq!(rows[0].source, CCSWITCH_LOCAL_PROVIDER_SOURCE);
         assert_eq!(rows[0].source_id.as_deref(), Some("cc-row"));

@@ -1,7 +1,7 @@
 use super::ccswitch::codex_section_from_table;
 use super::official_auth::{
     auth_value_has_material, build_official_config_text,
-    capture_live_official_config_before_provider_switch, document_is_official,
+    capture_live_official_config_before_provider_switch, document_is_official, is_chatgpt_auth,
     live_config_is_official, mark_official_config_reset, official_config_candidate,
     official_snapshot_path, save_official_config_snapshot, validate_official_config_text,
 };
@@ -85,6 +85,30 @@ fn provider_auth_action(api_key: Option<&str>) -> LiveAuthAction {
     LiveAuthAction::Replace(Value::Object(auth))
 }
 
+fn live_auth_is_chatgpt(old_auth: Option<&[u8]>) -> bool {
+    old_auth
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+        .is_some_and(|auth| is_chatgpt_auth(&auth))
+}
+
+fn configure_provider_live_auth(
+    doc: &mut DocumentMut,
+    provider_id: &str,
+    api_key: Option<&str>,
+    old_auth: Option<&[u8]>,
+) -> Result<LiveAuthAction> {
+    let api_key = api_key.map(str::trim).filter(|key| !key.is_empty());
+    if let Some(api_key) = api_key {
+        let providers = ensure_table(doc.as_table_mut(), "model_providers")?;
+        let provider = ensure_table(providers, provider_id)?;
+        provider["experimental_bearer_token"] = value(api_key);
+    }
+    if live_auth_is_chatgpt(old_auth) {
+        return Ok(LiveAuthAction::Keep);
+    }
+    Ok(provider_auth_action(api_key))
+}
+
 fn live_auth_api_key(codex_dir: &Path) -> Result<Option<String>> {
     let path = auth_path(codex_dir);
     let Some(bytes) = read_file_snapshot(&path)? else {
@@ -106,6 +130,7 @@ fn live_auth_api_key(codex_dir: &Path) -> Result<Option<String>> {
         .map(ToString::to_string))
 }
 
+#[derive(Debug)]
 struct AppliedLiveFiles {
     config_path: PathBuf,
     auth_path: PathBuf,
@@ -123,21 +148,55 @@ impl AppliedLiveFiles {
         }
 
         let mut failures = Vec::new();
-        if let Some(new_auth) = &self.new_auth {
-            if let Err(error) = restore_file_snapshot_if_unchanged(
-                &self.auth_path,
-                new_auth.as_deref(),
-                self.old_auth.as_deref(),
-            ) {
-                failures.push(format!("auth.json: {error}"));
+        match &self.new_auth {
+            // All replacements publish the target route first. Provider routes
+            // carry their target credential in experimental_bearer_token, so
+            // the old global credential is never sent to the new endpoint.
+            // Restore auth first when reversing this transition so a newly
+            // restored official credential cannot reach the old proxy route.
+            Some(Some(new_auth)) => {
+                if let Err(error) = restore_file_snapshot_if_unchanged(
+                    &self.auth_path,
+                    Some(new_auth.as_slice()),
+                    self.old_auth.as_deref(),
+                ) {
+                    failures.push(format!("auth.json: {error}"));
+                }
+                if let Err(error) = restore_file_snapshot_if_unchanged(
+                    &self.config_path,
+                    Some(self.new_config.as_slice()),
+                    self.old_config.as_deref(),
+                ) {
+                    failures.push(format!("config.toml: {error}"));
+                }
             }
-        }
-        if let Err(error) = restore_file_snapshot_if_unchanged(
-            &self.config_path,
-            Some(self.new_config.as_slice()),
-            self.old_config.as_deref(),
-        ) {
-            failures.push(format!("config.toml: {error}"));
+            // Remove publishes the new route before removing the credential.
+            // Restore the credential first when reversing that transition.
+            Some(None) => {
+                if let Err(error) = restore_file_snapshot_if_unchanged(
+                    &self.auth_path,
+                    None,
+                    self.old_auth.as_deref(),
+                ) {
+                    failures.push(format!("auth.json: {error}"));
+                }
+                if let Err(error) = restore_file_snapshot_if_unchanged(
+                    &self.config_path,
+                    Some(self.new_config.as_slice()),
+                    self.old_config.as_deref(),
+                ) {
+                    failures.push(format!("config.toml: {error}"));
+                }
+            }
+            None => {
+                if let Err(error) = restore_file_snapshot_if_unchanged(
+                    &self.config_path,
+                    Some(self.new_config.as_slice()),
+                    self.old_config.as_deref(),
+                ) {
+                    failures.push(format!("config.toml: {error}"));
+                }
+            }
         }
         if failures.is_empty() {
             Ok(())
@@ -241,6 +300,27 @@ fn write_live_files(
     config_text: &str,
     auth_action: &LiveAuthAction,
 ) -> Result<AppliedLiveFiles> {
+    write_live_files_with_between_writes(
+        codex_dir,
+        old_config,
+        old_auth,
+        config_text,
+        auth_action,
+        || Ok(()),
+    )
+}
+
+fn write_live_files_with_between_writes<F>(
+    codex_dir: &Path,
+    old_config: Option<Vec<u8>>,
+    old_auth: Option<Vec<u8>>,
+    config_text: &str,
+    auth_action: &LiveAuthAction,
+    between_writes: F,
+) -> Result<AppliedLiveFiles>
+where
+    F: FnOnce() -> Result<()>,
+{
     let cfg = config_path(codex_dir);
     let auth = auth_path(codex_dir);
     let new_config = config_text.as_bytes().to_vec();
@@ -249,35 +329,57 @@ fn write_live_files(
         LiveAuthAction::Replace(value) => Some(Some(json_bytes(&auth, value)?)),
         LiveAuthAction::Remove => Some(None),
     };
-    let mut config_written = false;
 
-    let write_result = (|| -> Result<()> {
-        atomic_write_if_unchanged(&cfg, old_config.as_deref(), &new_config)?;
-        config_written = true;
-        match &new_auth {
-            None => Ok(()),
-            Some(Some(bytes)) => atomic_write_if_unchanged(&auth, old_auth.as_deref(), bytes),
-            Some(None) => remove_file_if_unchanged(&auth, old_auth.as_deref()),
+    match &new_auth {
+        Some(Some(bytes)) => {
+            // Provider routes contain a provider-scoped bearer token, which
+            // takes precedence over auth.json. Publish the target route first;
+            // this also prevents an official credential from ever being
+            // visible while the previous third-party endpoint is active.
+            atomic_write_if_unchanged(&cfg, old_config.as_deref(), &new_config)?;
+            let write_result = between_writes()
+                .and_then(|()| atomic_write_if_unchanged(&auth, old_auth.as_deref(), bytes));
+            if let Err(error) = write_result {
+                let rollback = restore_file_snapshot_if_unchanged(
+                    &cfg,
+                    Some(new_config.as_slice()),
+                    old_config.as_deref(),
+                );
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(CodexxError::Config(format!(
+                        "写入 Codex live 配置失败：{error}；config.toml 回滚也失败：{rollback_error}"
+                    ))),
+                };
+            }
         }
-    })();
-
-    if let Err(error) = write_result {
-        if !config_written {
-            return Err(error);
+        Some(None) => {
+            // When the target route intentionally has no stored credential,
+            // publish that route first. Removing auth while the old proxy route
+            // is still active can make a long-lived Codex process cache a false
+            // unauthenticated state.
+            atomic_write_if_unchanged(&cfg, old_config.as_deref(), &new_config)?;
+            let write_result = between_writes()
+                .and_then(|()| remove_file_if_unchanged(&auth, old_auth.as_deref()));
+            if let Err(error) = write_result {
+                let rollback = restore_file_snapshot_if_unchanged(
+                    &cfg,
+                    Some(new_config.as_slice()),
+                    old_config.as_deref(),
+                );
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(CodexxError::Config(format!(
+                        "写入 Codex live 配置失败：{error}；config.toml 回滚也失败：{rollback_error}"
+                    ))),
+                };
+            }
         }
-        let rollback = restore_file_snapshot_if_unchanged(
-            &cfg,
-            Some(new_config.as_slice()),
-            old_config.as_deref(),
-        );
-        if rollback.is_ok() {
-            return Err(error);
+        None => {
+            atomic_write_if_unchanged(&cfg, old_config.as_deref(), &new_config)?;
         }
-        return Err(CodexxError::Config(format!(
-            "写入 Codex live 配置失败：{error}；config.toml 回滚也失败：{}",
-            rollback.unwrap_err()
-        )));
     }
+
     Ok(AppliedLiveFiles {
         config_path: cfg,
         auth_path: auth,
@@ -844,7 +946,7 @@ where
         pre_persist(codex_dir)?;
         let backup_id = create_backup(codex_dir, "save-provider-toml")?;
         let current_text = text_from_snapshot(&cfg, old_config.as_deref())?;
-        let (doc, api_key) = merge_provider_toml_into_live(
+        let (mut doc, api_key) = merge_provider_toml_into_live(
             &cfg,
             &current_text,
             input.config_text.trim_end(),
@@ -861,8 +963,13 @@ where
             .filter(|name| !name.is_empty())
             .unwrap_or("供应商");
         let message = format!("已切换到 {provider_name}");
+        let auth_action = configure_provider_live_auth(
+            &mut doc,
+            "custom",
+            api_key.as_deref(),
+            old_auth.as_deref(),
+        )?;
         let replacement = doc.to_string().trim_end().to_string() + "\n";
-        let auth_action = provider_auth_action(api_key.as_deref());
         Ok((backup_id, replacement, message, auth_action))
     })();
     let (backup_id, replacement, message, auth_action) = match prepared {
@@ -968,7 +1075,12 @@ where
                 "该供应商需要 API Key，未切换且未修改 auth.json".to_string(),
             ));
         }
-        let auth_action = provider_auth_action(api_key.as_deref());
+        let auth_action = configure_provider_live_auth(
+            &mut doc,
+            live_provider_key,
+            api_key.as_deref(),
+            old_auth.as_deref(),
+        )?;
         Ok((backup_id, doc.to_string(), auth_action))
     })();
     let (backup_id, replacement, auth_action) = match prepared {
@@ -1175,6 +1287,194 @@ requires_openai_auth = false
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create active provider test directory");
         path
+    }
+
+    #[test]
+    fn replacing_auth_publishes_official_route_before_official_credential() {
+        let codex_dir = active_provider_test_dir("official-before-official-auth", 29_996);
+        let old_config = "model_provider = \"custom\"\nmodel = \"proxy-model\"\n";
+        let new_config = "model_provider = \"openai\"\nmodel = \"official-model\"\n";
+        let old_auth = json!({"OPENAI_API_KEY": "proxy-key"});
+        let new_auth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "official-access"}
+        });
+        write_text(&config_path(&codex_dir), old_config).expect("write old config");
+        write_json(&auth_path(&codex_dir), &old_auth).expect("write old auth");
+
+        let old_config_snapshot =
+            read_file_snapshot(&config_path(&codex_dir)).expect("snapshot old config");
+        let old_auth_snapshot =
+            read_file_snapshot(&auth_path(&codex_dir)).expect("snapshot old auth");
+        write_live_files_with_between_writes(
+            &codex_dir,
+            old_config_snapshot,
+            old_auth_snapshot,
+            new_config,
+            &LiveAuthAction::Replace(new_auth.clone()),
+            || {
+                assert_eq!(
+                    fs::read_to_string(config_path(&codex_dir)).expect("read route between writes"),
+                    new_config
+                );
+                assert_eq!(
+                    serde_json::from_slice::<Value>(
+                        &fs::read(auth_path(&codex_dir)).expect("read auth between writes")
+                    )
+                    .expect("parse auth between writes"),
+                    old_auth
+                );
+                Ok(())
+            },
+        )
+        .expect("replace live files");
+
+        assert_eq!(
+            fs::read_to_string(config_path(&codex_dir)).expect("read final config"),
+            new_config
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(auth_path(&codex_dir)).expect("read final auth")
+            )
+            .expect("parse final auth"),
+            new_auth
+        );
+        fs::remove_dir_all(codex_dir).expect("remove official-before-official-auth test directory");
+    }
+
+    #[test]
+    fn replacing_auth_publishes_scoped_proxy_route_before_global_credential() {
+        let codex_dir = active_provider_test_dir("proxy-before-global-auth", 29_997);
+        let old_config = "model_provider = \"openai\"\nmodel = \"official-model\"\n";
+        let new_config = r#"model_provider = "custom"
+model = "proxy-model"
+
+[model_providers.custom]
+base_url = "https://proxy.example.com/v1"
+experimental_bearer_token = "proxy-key"
+"#;
+        let old_auth = json!({"OPENAI_API_KEY": "official-key"});
+        let new_auth = json!({"OPENAI_API_KEY": "proxy-key"});
+        write_text(&config_path(&codex_dir), old_config).expect("write old config");
+        write_json(&auth_path(&codex_dir), &old_auth).expect("write old auth");
+
+        let old_config_snapshot =
+            read_file_snapshot(&config_path(&codex_dir)).expect("snapshot old config");
+        let old_auth_snapshot =
+            read_file_snapshot(&auth_path(&codex_dir)).expect("snapshot old auth");
+        write_live_files_with_between_writes(
+            &codex_dir,
+            old_config_snapshot,
+            old_auth_snapshot,
+            new_config,
+            &LiveAuthAction::Replace(new_auth.clone()),
+            || {
+                assert_eq!(
+                    fs::read_to_string(config_path(&codex_dir)).expect("read route between writes"),
+                    new_config
+                );
+                assert_eq!(
+                    serde_json::from_slice::<Value>(
+                        &fs::read(auth_path(&codex_dir)).expect("read auth between writes")
+                    )
+                    .expect("parse auth between writes"),
+                    old_auth
+                );
+                Ok(())
+            },
+        )
+        .expect("replace live files");
+
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(auth_path(&codex_dir)).expect("read final auth")
+            )
+            .expect("parse final auth"),
+            new_auth
+        );
+        fs::remove_dir_all(codex_dir).expect("remove proxy-before-global-auth test directory");
+    }
+
+    #[test]
+    fn removing_auth_publishes_official_route_before_deleting_credential() {
+        let codex_dir = active_provider_test_dir("official-before-auth-remove", 29_998);
+        let old_config = "model_provider = \"custom\"\nmodel = \"proxy-model\"\n";
+        let new_config = "model_provider = \"openai\"\nmodel = \"official-model\"\n";
+        let old_auth = json!({"OPENAI_API_KEY": "proxy-key"});
+        write_text(&config_path(&codex_dir), old_config).expect("write old config");
+        write_json(&auth_path(&codex_dir), &old_auth).expect("write old auth");
+
+        let old_config_snapshot =
+            read_file_snapshot(&config_path(&codex_dir)).expect("snapshot old config");
+        let old_auth_snapshot =
+            read_file_snapshot(&auth_path(&codex_dir)).expect("snapshot old auth");
+        write_live_files_with_between_writes(
+            &codex_dir,
+            old_config_snapshot,
+            old_auth_snapshot,
+            new_config,
+            &LiveAuthAction::Remove,
+            || {
+                assert_eq!(
+                    fs::read_to_string(config_path(&codex_dir)).expect("read route between writes"),
+                    new_config
+                );
+                assert_eq!(
+                    serde_json::from_slice::<Value>(
+                        &fs::read(auth_path(&codex_dir)).expect("read auth between writes")
+                    )
+                    .expect("parse auth between writes"),
+                    old_auth
+                );
+                Ok(())
+            },
+        )
+        .expect("remove live auth");
+
+        assert!(!auth_path(&codex_dir).exists());
+        fs::remove_dir_all(codex_dir).expect("remove official-before-auth-remove test directory");
+    }
+
+    #[test]
+    fn auth_failure_rolls_back_config_first_write() {
+        let codex_dir = active_provider_test_dir("config-first-rollback", 29_999);
+        let old_config = "model_provider = \"openai\"\nmodel = \"official-model\"\n";
+        let old_auth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "official-access"}
+        });
+        let external_auth = json!({"OPENAI_API_KEY": "external-key"});
+        write_text(&config_path(&codex_dir), old_config).expect("write old config");
+        write_json(&auth_path(&codex_dir), &old_auth).expect("write old auth");
+
+        let old_config_snapshot =
+            read_file_snapshot(&config_path(&codex_dir)).expect("snapshot old config");
+        let old_auth_snapshot =
+            read_file_snapshot(&auth_path(&codex_dir)).expect("snapshot old auth");
+        let error = write_live_files_with_between_writes(
+            &codex_dir,
+            old_config_snapshot,
+            old_auth_snapshot,
+            "model_provider = \"custom\"\nmodel = \"proxy-model\"\n",
+            &LiveAuthAction::Replace(json!({"OPENAI_API_KEY": "proxy-key"})),
+            || write_json(&auth_path(&codex_dir), &external_auth),
+        )
+        .expect_err("stale auth must fail after config write");
+
+        assert!(error.to_string().contains("已被其他程序修改"));
+        assert_eq!(
+            fs::read_to_string(config_path(&codex_dir)).expect("read rolled back config"),
+            old_config
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(auth_path(&codex_dir)).expect("read rolled back auth")
+            )
+            .expect("parse external auth"),
+            external_auth
+        );
+        fs::remove_dir_all(codex_dir).expect("remove config-first-rollback test directory");
     }
 
     #[test]
@@ -1451,9 +1751,10 @@ command = "docs-server"
             doc["mcp_servers"]["docs"]["command"].as_str(),
             Some("docs-server")
         );
-        assert!(doc["model_providers"]["custom"]
-            .get("experimental_bearer_token")
-            .is_none());
+        assert_eq!(
+            doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+            Some("sk-after")
+        );
         assert_eq!(saved_provider(&id).provider_name, "After");
         let auth_after: Value = serde_json::from_str(
             &fs::read_to_string(auth_path(&codex_dir)).expect("read official auth"),
