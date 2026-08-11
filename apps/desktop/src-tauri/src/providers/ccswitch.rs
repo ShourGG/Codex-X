@@ -32,6 +32,7 @@ pub(crate) struct ImportResult {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OfficialAuthCandidate {
     auth_json: String,
+    config_text: Option<String>,
     model: Option<String>,
     source: String,
 }
@@ -485,9 +486,12 @@ pub(crate) fn read_ccswitch_official_auth_inner(
             CodexxError::Database("cc-switch official provider 缺少 auth object".to_string())
         })?;
 
-    let model = settings
+    let config_text = settings
         .get("config")
         .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let model = config_text
+        .as_deref()
         .and_then(|text| text.parse::<DocumentMut>().ok())
         .and_then(|doc| string_value(&doc, "model"));
 
@@ -496,6 +500,7 @@ pub(crate) fn read_ccswitch_official_auth_inner(
 
     Ok(Some(OfficialAuthCandidate {
         auth_json,
+        config_text,
         model,
         source: format!("cc-switch:{name}:{id}"),
     }))

@@ -930,7 +930,7 @@ async fn restore_official_provider(config_dir: Option<String>) -> Result<ActionR
 #[tauri::command]
 async fn reset_official_provider(input: OfficialConfigInput) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        reset_official_provider_inner(input.config_dir, input.model)
+        reset_official_provider_inner(input.config_dir, input.model, input.config_text)
     })
     .await
     .map_err(|e| CodexxError::Config(format!("新建官方配置失败: {e}")))?
@@ -939,7 +939,12 @@ async fn reset_official_provider(input: OfficialConfigInput) -> Result<ActionRes
 #[tauri::command]
 async fn save_official_config(input: OfficialConfigInput) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        save_official_config_inner(input.config_dir, input.model, input.auth_json)
+        save_official_config_inner(
+            input.config_dir,
+            input.model,
+            input.auth_json,
+            input.config_text,
+        )
     })
     .await
     .map_err(|e| CodexxError::Config(format!("保存官方配置失败: {e}")))?
@@ -1245,6 +1250,10 @@ fn restore_backup_inner(config_dir: Option<String>, backup_id: String) -> Result
         None => None,
     };
     let backup_auth = declared_backup_file_snapshot(&backup_auth, backup_meta.had_auth)?;
+    if let Some(bytes) = backup_auth.as_deref() {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .map_err(|error| file_io::json_err(&dir.join("auth.json"), error))?;
+    }
     let backup_agents = declared_backup_file_snapshot(&backup_agents, backup_meta.had_agents)?;
 
     ensure_directory(&codex_dir)?;

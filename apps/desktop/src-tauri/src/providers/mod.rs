@@ -52,8 +52,8 @@ pub(crate) use store::{
     matching_saved_provider_ids_for_live, normalize_saved_provider,
     provider_template_from_document, reserved_codex_provider_id, rollback_provider_store_inner,
     save_provider_inner, save_provider_with_rollback_inner, strip_provider_bearer_tokens,
-    unique_saved_provider_id_for_live, upsert_ccswitch_provider_on_connection, ProviderUpsertKind,
-    SavedProvider,
+    unique_saved_provider_id_for_live, upsert_ccswitch_provider_on_connection,
+    ProviderStoreRollback, ProviderUpsertKind, SavedProvider,
 };
 
 pub(crate) fn open_store() -> Result<Connection> {

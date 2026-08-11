@@ -1,15 +1,17 @@
 use super::ccswitch::codex_section_from_table;
 use super::official_auth::{
-    auth_value_has_material, capture_live_official_config_before_provider_switch,
-    document_is_official, live_config_is_official, mark_official_config_reset,
-    official_config_candidate, official_snapshot_path, save_official_config_snapshot,
+    auth_value_has_material, build_official_config_text,
+    capture_live_official_config_before_provider_switch, document_is_official,
+    live_config_is_official, mark_official_config_reset, official_config_candidate,
+    official_snapshot_path, save_official_config_snapshot, validate_official_config_text,
 };
 use super::{
     custom_provider_id, delete_provider_inner, experimental_bearer_token_from_doc,
     is_placeholder_provider, list_saved_providers_inner, list_saved_providers_on_connection,
     matching_saved_provider_ids_for_live, normalize_saved_provider, open_store,
     provider_template_from_document, reserved_codex_provider_id, rollback_provider_store_inner,
-    save_provider_with_rollback_inner, strip_provider_bearer_tokens, SavedProvider,
+    save_provider_with_rollback_inner, strip_provider_bearer_tokens,
+    unique_saved_provider_id_for_live, ProviderStoreRollback, SavedProvider,
 };
 use crate::backups::create_backup;
 use crate::config_migration::migrate_legacy_prompt_config_locked;
@@ -56,9 +58,10 @@ pub(crate) struct OfficialConfigInput {
     pub(crate) config_dir: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) auth_json: Option<String>,
+    pub(crate) config_text: Option<String>,
 }
 
-enum OfficialAuthAction {
+enum LiveAuthAction {
     Keep,
     Replace(Value),
     Remove,
@@ -70,12 +73,31 @@ fn json_bytes(path: &Path, value: &Value) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn provider_auth_action(api_key: Option<&str>) -> LiveAuthAction {
+    let Some(api_key) = api_key.map(str::trim).filter(|key| !key.is_empty()) else {
+        return LiveAuthAction::Remove;
+    };
+    let mut auth = serde_json::Map::new();
+    auth.insert(
+        "OPENAI_API_KEY".to_string(),
+        Value::String(api_key.to_string()),
+    );
+    LiveAuthAction::Replace(Value::Object(auth))
+}
+
 fn live_auth_api_key(codex_dir: &Path) -> Result<Option<String>> {
     let path = auth_path(codex_dir);
     let Some(bytes) = read_file_snapshot(&path)? else {
         return Ok(None);
     };
-    let auth: Value = serde_json::from_slice(&bytes).map_err(|error| json_err(&path, error))?;
+    // A stale or partially-written auth file must not make the whole manager
+    // unusable. Provider switches replace this file atomically, so treat an
+    // invalid JSON payload as having no reusable key and let the switch repair
+    // it. I/O failures still propagate.
+    let auth: Value = match serde_json::from_slice(&bytes) {
+        Ok(auth) => auth,
+        Err(_) => return Ok(None),
+    };
     Ok(auth
         .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
@@ -196,20 +218,36 @@ fn rollback_after_failure<T>(
     }
 }
 
+fn rollback_persisted_provider<T>(
+    result: Result<T>,
+    rollback: Option<ProviderStoreRollback>,
+) -> Result<T> {
+    match (result, rollback) {
+        (Ok(value), _) => Ok(value),
+        (Err(error), None) => Err(error),
+        (Err(error), Some(rollback)) => match rollback_provider_store_inner(rollback) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(CodexxError::Database(format!(
+                "{error}；供应商配置回滚失败: {rollback_error}"
+            ))),
+        },
+    }
+}
+
 fn write_live_files(
     codex_dir: &Path,
     old_config: Option<Vec<u8>>,
     old_auth: Option<Vec<u8>>,
     config_text: &str,
-    auth_action: &OfficialAuthAction,
+    auth_action: &LiveAuthAction,
 ) -> Result<AppliedLiveFiles> {
     let cfg = config_path(codex_dir);
     let auth = auth_path(codex_dir);
     let new_config = config_text.as_bytes().to_vec();
     let new_auth = match auth_action {
-        OfficialAuthAction::Keep => None,
-        OfficialAuthAction::Replace(value) => Some(Some(json_bytes(&auth, value)?)),
-        OfficialAuthAction::Remove => Some(None),
+        LiveAuthAction::Keep => None,
+        LiveAuthAction::Replace(value) => Some(Some(json_bytes(&auth, value)?)),
+        LiveAuthAction::Remove => Some(None),
     };
     let mut config_written = false;
 
@@ -247,23 +285,6 @@ fn write_live_files(
         old_auth,
         new_config,
         new_auth,
-    })
-}
-
-fn write_live_config(
-    codex_dir: &Path,
-    old_config: Option<Vec<u8>>,
-    replacement: Vec<u8>,
-) -> Result<AppliedLiveFiles> {
-    let cfg = config_path(codex_dir);
-    atomic_write_if_unchanged(&cfg, old_config.as_deref(), &replacement)?;
-    Ok(AppliedLiveFiles {
-        config_path: cfg,
-        auth_path: auth_path(codex_dir),
-        old_config,
-        old_auth: None,
-        new_config: replacement,
-        new_auth: None,
     })
 }
 
@@ -323,6 +344,27 @@ pub(crate) fn detected_live_custom_provider(codex_dir: &Path) -> Result<Option<S
     }))
 }
 
+fn persist_detected_live_custom_provider(
+    codex_dir: &Path,
+) -> Result<Option<ProviderStoreRollback>> {
+    let Some(mut live) = detected_live_custom_provider(codex_dir)? else {
+        return Ok(None);
+    };
+    let saved = list_saved_providers_inner()?;
+    let Some(saved_id) = unique_saved_provider_id_for_live(&live, &saved) else {
+        return Ok(None);
+    };
+    if live.api_key.is_none() {
+        live.api_key = saved
+            .iter()
+            .find(|provider| provider.id == saved_id)
+            .and_then(|provider| provider.api_key.clone());
+    }
+    live.id = saved_id;
+    let (_, rollback) = save_provider_with_rollback_inner(live)?;
+    Ok(Some(rollback))
+}
+
 pub(crate) fn build_provider_toml_draft_inner(
     mut provider: SavedProvider,
     config_dir: Option<String>,
@@ -369,31 +411,12 @@ pub(crate) fn build_provider_toml_draft_inner(
         .ok_or_else(|| CodexxError::Config("无法生成供应商 TOML".to_string()))
 }
 
-fn set_provider_bearer_token(doc: &mut DocumentMut, token: &str) {
-    let token = token.trim();
-    if token.is_empty() {
-        return;
-    }
-    let provider_id = string_value(doc, "model_provider");
-    if let Some(provider_id) = provider_id {
-        if let Some(provider_table) = doc
-            .get_mut("model_providers")
-            .and_then(|item| item.as_table_mut())
-            .and_then(|providers| providers.get_mut(provider_id.as_str()))
-            .and_then(|item| item.as_table_mut())
-        {
-            provider_table["experimental_bearer_token"] = value(token);
-            return;
-        }
-    }
-    doc["experimental_bearer_token"] = value(token);
-}
-
 fn apply_official_config_locked(
     codex_dir: &Path,
+    config_text: Option<&str>,
     model: Option<&str>,
     clear_model_if_none: bool,
-    auth_action: OfficialAuthAction,
+    auth_action: LiveAuthAction,
     action: &str,
 ) -> Result<(Option<String>, AppliedLiveFiles)> {
     let cfg = config_path(codex_dir);
@@ -402,35 +425,21 @@ fn apply_official_config_locked(
     let old_auth = read_file_snapshot(&auth)?;
     let backup_id = create_backup(codex_dir, action)?;
 
-    let text = text_from_snapshot(&cfg, old_config.as_deref())?;
-    let mut doc = parse_toml_document(&cfg, &text)?;
+    let config_text = match config_text.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(config_text) => validate_official_config_text(codex_dir, config_text, model)?.0,
+        None => {
+            let config = build_official_config_text(codex_dir, model, clear_model_if_none)?;
+            validate_official_config_text(codex_dir, &config, model)?.0
+        }
+    };
 
-    // Keep official and third-party conversations in the same stable bucket.
-    // Omitting base_url preserves the real OpenAI backend and auth.json login.
-    doc["model_provider"] = value("custom");
-    doc.as_table_mut().remove("experimental_bearer_token");
-    let providers = ensure_table(doc.as_table_mut(), "model_providers")?;
-    providers.remove("custom");
-    let official = ensure_table(providers, "custom")?;
-    official["name"] = value("OpenAI");
-    official["requires_openai_auth"] = value(true);
-    official["supports_websockets"] = value(true);
-    official["wire_api"] = value("responses");
-
-    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
-        doc["model"] = value(model);
-    } else if clear_model_if_none {
-        doc.as_table_mut().remove("model");
-    }
-
-    let applied = write_live_files(
-        codex_dir,
-        old_config,
-        old_auth,
-        &doc.to_string(),
-        &auth_action,
-    )?;
+    let applied = write_live_files(codex_dir, old_config, old_auth, &config_text, &auth_action)?;
     Ok((backup_id, applied))
+}
+
+fn applied_config_text(live: &AppliedLiveFiles) -> Result<String> {
+    String::from_utf8(live.new_config.clone())
+        .map_err(|error| CodexxError::Config(format!("config.toml 不是有效 UTF-8: {error}")))
 }
 
 fn finish_live_action(
@@ -468,32 +477,46 @@ where
     let model = candidate
         .as_ref()
         .and_then(|candidate| candidate.model.clone());
-    let auth_action = candidate
+    let config_text = candidate
         .as_ref()
-        .map(|candidate| OfficialAuthAction::Replace(candidate.auth.clone()))
-        .unwrap_or(if was_official {
+        .and_then(|candidate| candidate.config_text.clone());
+    let candidate_auth = candidate
+        .as_ref()
+        .and_then(|candidate| candidate.auth.clone());
+    let auth_action = candidate_auth
+        .clone()
+        .map(LiveAuthAction::Replace)
+        .unwrap_or(if candidate.is_some() {
+            LiveAuthAction::Remove
+        } else if was_official {
             // A user may legitimately use the built-in OpenAI provider with an
             // API key. It is safe to keep only while the live route is already
             // official; an API key seen under a proxy route remains ambiguous.
-            OfficialAuthAction::Keep
+            LiveAuthAction::Keep
         } else {
-            OfficialAuthAction::Remove
+            LiveAuthAction::Remove
         });
-    let source = candidate.as_ref().map(|candidate| candidate.source.clone());
-    let message = source
-        .as_deref()
-        .map(|source| format!("已切换到 OpenAI Official，并恢复：{source}"))
-        .unwrap_or_else(|| "已切换到 OpenAI Official，请在 Codex 中完成登录".to_string());
+    let message = if candidate_auth.is_some() {
+        "已切换到 OpenAI Official".to_string()
+    } else {
+        "已切换到 OpenAI Official，请在 Codex 中完成登录".to_string()
+    };
     let (backup_id, live) = apply_official_config_locked(
         &codex_dir,
+        config_text.as_deref(),
         model.as_deref(),
         !was_official && model.is_none(),
         auth_action,
         "switch-official",
     )?;
     let snapshot = if let Some(candidate) = candidate {
+        let applied_config = applied_config_text(&live)?;
         match update_official_snapshot(&codex_dir, || {
-            save_official_config_snapshot(&codex_dir, model, &candidate.auth)
+            if let Some(auth) = candidate.auth.as_ref() {
+                save_official_config_snapshot(&codex_dir, Some(applied_config), model, auth)
+            } else {
+                mark_official_config_reset(&codex_dir, Some(applied_config), model)
+            }
         }) {
             Ok(snapshot) => Some(snapshot),
             Err(error) => return rollback_after_failure(error, Some(&live), None),
@@ -505,13 +528,19 @@ where
 }
 
 pub(crate) fn switch_official_provider_inner(config_dir: Option<String>) -> Result<ActionResult> {
-    switch_official_provider_with_pre_persist(config_dir, |_| Ok(()))
+    let mut provider_rollback = None;
+    let result = switch_official_provider_with_pre_persist(config_dir, |codex_dir| {
+        provider_rollback = persist_detected_live_custom_provider(codex_dir)?;
+        Ok(())
+    });
+    rollback_persisted_provider(result, provider_rollback)
 }
 
 pub(crate) fn save_official_config_inner(
     config_dir: Option<String>,
     model: Option<String>,
     auth_json: Option<String>,
+    config_text: Option<String>,
 ) -> Result<ActionResult> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     ensure_directory(&codex_dir)?;
@@ -521,6 +550,7 @@ pub(crate) fn save_official_config_inner(
     let model = model
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let existing = official_config_candidate(&codex_dir, false)?;
     let parsed_auth = if let Some(auth_json) = auth_json
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -533,23 +563,48 @@ pub(crate) fn save_official_config_inner(
         }
         parsed
     } else {
-        official_config_candidate(&codex_dir, true)?
-            .map(|candidate| candidate.auth)
+        existing
+            .as_ref()
+            .and_then(|candidate| candidate.auth.clone())
             .ok_or_else(|| {
                 CodexxError::Config("没有可保存的官方认证，请先完成官方登录".to_string())
             })?
+    };
+    let requested_config = config_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|candidate| candidate.config_text.clone())
+        });
+    let (official_config, effective_model) = match requested_config {
+        Some(config) => validate_official_config_text(&codex_dir, &config, model.as_deref())?,
+        None => {
+            let config = build_official_config_text(&codex_dir, model.as_deref(), false)?;
+            validate_official_config_text(&codex_dir, &config, model.as_deref())?
+        }
     };
 
     if live_config_is_official(&codex_dir)? {
         let (backup_id, live) = apply_official_config_locked(
             &codex_dir,
-            model.as_deref(),
+            Some(&official_config),
+            effective_model.as_deref(),
             false,
-            OfficialAuthAction::Replace(parsed_auth.clone()),
+            LiveAuthAction::Replace(parsed_auth.clone()),
             "save-official",
         )?;
+        let applied_config = applied_config_text(&live)?;
         let snapshot = match update_official_snapshot(&codex_dir, || {
-            save_official_config_snapshot(&codex_dir, model, &parsed_auth)
+            save_official_config_snapshot(
+                &codex_dir,
+                Some(applied_config),
+                effective_model,
+                &parsed_auth,
+            )
         }) {
             Ok(snapshot) => snapshot,
             Err(error) => return rollback_after_failure(error, Some(&live), None),
@@ -565,7 +620,12 @@ pub(crate) fn save_official_config_inner(
 
     let backup_id = create_backup(&codex_dir, "save-official-snapshot")?;
     let snapshot = update_official_snapshot(&codex_dir, || {
-        save_official_config_snapshot(&codex_dir, model, &parsed_auth)
+        save_official_config_snapshot(
+            &codex_dir,
+            Some(official_config),
+            effective_model,
+            &parsed_auth,
+        )
     })?;
     match build_state_after_migration(codex_dir.clone()) {
         Ok(state) => Ok(ActionResult {
@@ -589,9 +649,14 @@ pub(crate) fn restore_official_provider_inner(config_dir: Option<String>) -> Res
         )
     })?;
     let model = candidate.model.clone();
+    let config_text = candidate.config_text.clone();
     let message = "已还原 OpenAI Official 配置".to_string();
     let snapshot = update_official_snapshot(&codex_dir, || {
-        save_official_config_snapshot(&codex_dir, model, &candidate.auth)
+        if let Some(auth) = candidate.auth.as_ref() {
+            save_official_config_snapshot(&codex_dir, config_text, model, auth)
+        } else {
+            mark_official_config_reset(&codex_dir, config_text, model)
+        }
     })?;
     match build_state_after_migration(codex_dir.clone()) {
         Ok(state) => Ok(ActionResult {
@@ -604,26 +669,45 @@ pub(crate) fn restore_official_provider_inner(config_dir: Option<String>) -> Res
     }
 }
 
-pub(crate) fn reset_official_provider_inner(
+fn reset_official_provider_with_pre_persist<F>(
     config_dir: Option<String>,
     model: Option<String>,
-) -> Result<ActionResult> {
+    config_text: Option<String>,
+    pre_persist: F,
+) -> Result<ActionResult>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     let codex_dir = resolve_codex_dir(config_dir)?;
     ensure_directory(&codex_dir)?;
     let _live_lock = acquire_live_config_lock(&codex_dir)?;
     migrate_legacy_prompt_config_locked(&codex_dir)?;
+    pre_persist(&codex_dir)?;
     let model = model
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let config_text = match config_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(config_text) => {
+            validate_official_config_text(&codex_dir, config_text, model.as_deref())?.0
+        }
+        None => build_official_config_text(&codex_dir, model.as_deref(), model.is_none())?,
+    };
     let (backup_id, live) = apply_official_config_locked(
         &codex_dir,
+        Some(&config_text),
         model.as_deref(),
         model.is_none(),
-        OfficialAuthAction::Remove,
+        LiveAuthAction::Remove,
         "reset-official",
     )?;
+    let applied_config = applied_config_text(&live)?;
+    let applied_model = validate_official_config_text(&codex_dir, &applied_config, None)?.1;
     let snapshot = match update_official_snapshot(&codex_dir, || {
-        mark_official_config_reset(&codex_dir, model)
+        mark_official_config_reset(&codex_dir, Some(applied_config), applied_model)
     }) {
         Ok(snapshot) => snapshot,
         Err(error) => return rollback_after_failure(error, Some(&live), None),
@@ -637,12 +721,26 @@ pub(crate) fn reset_official_provider_inner(
     )
 }
 
+pub(crate) fn reset_official_provider_inner(
+    config_dir: Option<String>,
+    model: Option<String>,
+    config_text: Option<String>,
+) -> Result<ActionResult> {
+    let mut provider_rollback = None;
+    let result =
+        reset_official_provider_with_pre_persist(config_dir, model, config_text, |codex_dir| {
+            provider_rollback = persist_detected_live_custom_provider(codex_dir)?;
+            Ok(())
+        });
+    rollback_persisted_provider(result, provider_rollback)
+}
+
 fn merge_provider_toml_into_live(
     cfg: &Path,
     current_text: &str,
     provider_text: &str,
     explicit_api_key: Option<String>,
-) -> Result<DocumentMut> {
+) -> Result<(DocumentMut, Option<String>)> {
     let source = parse_toml_document(cfg, provider_text)?;
     let model = string_value(&source, "model")
         .ok_or_else(|| CodexxError::Config("config.toml 必须包含 model".to_string()))?;
@@ -688,19 +786,46 @@ fn merge_provider_toml_into_live(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(|| experimental_bearer_token_from_doc(&source, Some(source_provider_id.as_str())));
-    source_provider.remove("experimental_bearer_token");
-    if let Some(api_key) = api_key {
-        source_provider["experimental_bearer_token"] = value(api_key);
+    let requires_openai_auth = source_provider
+        .get("requires_openai_auth")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    if requires_openai_auth && api_key.is_none() {
+        return Err(CodexxError::Config(
+            "该供应商需要 API Key，未切换且未修改 auth.json".to_string(),
+        ));
     }
+    source_provider.remove("experimental_bearer_token");
 
-    let mut live = parse_toml_document(cfg, current_text)?;
+    // New and cc-switch imports carry a complete provider config. Treat it as
+    // authoritative so provider-specific desktop/features/plugin settings make
+    // the round trip. Older Codex-X records contained only the route/model;
+    // those sparse templates inherit the current common settings for backward
+    // compatibility.
+    let has_multiple_provider_tables = source
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .is_some_and(|providers| providers.len() > 1);
+    let has_complete_config = has_multiple_provider_tables
+        || source
+            .as_table()
+            .iter()
+            .any(|(key, _)| !matches!(key, "model_provider" | "model" | "model_providers"));
+    let mut live = if has_complete_config {
+        source
+    } else {
+        parse_toml_document(cfg, current_text)?
+    };
+    strip_provider_bearer_tokens(&mut live);
     live["model_provider"] = value("custom");
     live["model"] = value(model);
-    live.as_table_mut().remove("experimental_bearer_token");
     let providers = ensure_table(live.as_table_mut(), "model_providers")?;
     providers.remove("custom");
+    if source_provider_id != "custom" {
+        providers.remove(&source_provider_id);
+    }
     providers.insert("custom", Item::Table(source_provider));
-    Ok(live)
+    Ok((live, api_key))
 }
 
 fn save_provider_toml_config_locked<F>(
@@ -713,12 +838,13 @@ where
     F: FnOnce(&Path) -> Result<()>,
 {
     let cfg = config_path(codex_dir);
+    let old_auth = read_file_snapshot(&auth_path(codex_dir))?;
     let snapshot = capture_live_official_snapshot(codex_dir)?;
-    let prepared = (|| -> Result<(Option<String>, Vec<u8>, String)> {
+    let prepared = (|| -> Result<(Option<String>, String, String, LiveAuthAction)> {
         pre_persist(codex_dir)?;
         let backup_id = create_backup(codex_dir, "save-provider-toml")?;
         let current_text = text_from_snapshot(&cfg, old_config.as_deref())?;
-        let doc = merge_provider_toml_into_live(
+        let (doc, api_key) = merge_provider_toml_into_live(
             &cfg,
             &current_text,
             input.config_text.trim_end(),
@@ -736,13 +862,14 @@ where
             .unwrap_or("供应商");
         let message = format!("已切换到 {provider_name}");
         let replacement = doc.to_string().trim_end().to_string() + "\n";
-        Ok((backup_id, replacement.into_bytes(), message))
+        let auth_action = provider_auth_action(api_key.as_deref());
+        Ok((backup_id, replacement, message, auth_action))
     })();
-    let (backup_id, replacement, message) = match prepared {
+    let (backup_id, replacement, message, auth_action) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return rollback_after_failure(error, None, snapshot.as_ref()),
     };
-    let live = match write_live_config(codex_dir, old_config, replacement) {
+    let live = match write_live_files(codex_dir, old_config, old_auth, &replacement, &auth_action) {
         Ok(live) => live,
         Err(error) => return rollback_after_failure(error, None, snapshot.as_ref()),
     };
@@ -765,7 +892,12 @@ where
 }
 
 pub(crate) fn save_provider_toml_config_inner(input: ProviderTomlInput) -> Result<ActionResult> {
-    save_provider_toml_config_with_pre_persist(input, |_| Ok(()))
+    let mut provider_rollback = None;
+    let result = save_provider_toml_config_with_pre_persist(input, |codex_dir| {
+        provider_rollback = persist_detected_live_custom_provider(codex_dir)?;
+        Ok(())
+    });
+    rollback_persisted_provider(result, provider_rollback)
 }
 
 fn switch_provider_locked<F>(
@@ -806,8 +938,9 @@ where
     }
 
     let cfg = config_path(codex_dir);
+    let old_auth = read_file_snapshot(&auth_path(codex_dir))?;
     let snapshot = capture_live_official_snapshot(codex_dir)?;
-    let prepared = (|| -> Result<(Option<String>, Vec<u8>)> {
+    let prepared = (|| -> Result<(Option<String>, String, LiveAuthAction)> {
         pre_persist(codex_dir)?;
         let backup_id = create_backup(codex_dir, "switch-provider")?;
         let text = text_from_snapshot(&cfg, old_config.as_deref())?;
@@ -823,22 +956,26 @@ where
         provider_table["base_url"] = value(base_url);
         provider_table["wire_api"] =
             value(input.wire_api.unwrap_or_else(|| "responses".to_string()));
-        provider_table["requires_openai_auth"] = value(input.requires_openai_auth.unwrap_or(true));
+        let requires_openai_auth = input.requires_openai_auth.unwrap_or(true);
+        provider_table["requires_openai_auth"] = value(requires_openai_auth);
 
         let api_key = input
             .api_key
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        if let Some(api_key) = api_key.as_deref() {
-            set_provider_bearer_token(&mut doc, api_key);
+        if requires_openai_auth && api_key.is_none() {
+            return Err(CodexxError::Config(
+                "该供应商需要 API Key，未切换且未修改 auth.json".to_string(),
+            ));
         }
-        Ok((backup_id, doc.to_string().into_bytes()))
+        let auth_action = provider_auth_action(api_key.as_deref());
+        Ok((backup_id, doc.to_string(), auth_action))
     })();
-    let (backup_id, replacement) = match prepared {
+    let (backup_id, replacement, auth_action) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return rollback_after_failure(error, None, snapshot.as_ref()),
     };
-    let live = match write_live_config(codex_dir, old_config, replacement) {
+    let live = match write_live_files(codex_dir, old_config, old_auth, &replacement, &auth_action) {
         Ok(live) => live,
         Err(error) => return rollback_after_failure(error, None, snapshot.as_ref()),
     };
@@ -867,7 +1004,12 @@ where
 }
 
 pub(crate) fn switch_provider_inner(input: ProviderInput) -> Result<ActionResult> {
-    switch_provider_with_pre_persist(input, |_| Ok(()))
+    let mut provider_rollback = None;
+    let result = switch_provider_with_pre_persist(input, |codex_dir| {
+        provider_rollback = persist_detected_live_custom_provider(codex_dir)?;
+        Ok(())
+    });
+    rollback_persisted_provider(result, provider_rollback)
 }
 
 fn save_active_provider_with_apply<F>(
@@ -1055,7 +1197,7 @@ requires_openai_auth = false
     }
 
     #[test]
-    fn provider_template_switch_uses_latest_live_common_config() {
+    fn complete_provider_template_replaces_live_common_config() {
         let current = r#"# keep-live-comment
 model_provider = "custom"
 model = "model-a"
@@ -1101,7 +1243,7 @@ command = "stale-server"
 trust_level = "untrusted"
 "#;
 
-        let merged = merge_provider_toml_into_live(
+        let (merged, api_key) = merge_provider_toml_into_live(
             Path::new("config.toml"),
             current,
             historical_template,
@@ -1110,24 +1252,24 @@ trust_level = "untrusted"
         .expect("merge provider template");
         let text = merged.to_string();
 
-        assert!(text.contains("# keep-live-comment"));
+        assert!(!text.contains("# keep-live-comment"));
         assert_eq!(merged["model_provider"].as_str(), Some("custom"));
         assert_eq!(merged["model"].as_str(), Some("model-b"));
-        assert_eq!(merged["approval_policy"].as_str(), Some("never"));
-        assert_eq!(merged["service_tier"].as_str(), Some("priority"));
+        assert_eq!(merged["approval_policy"].as_str(), Some("on-request"));
+        assert_eq!(merged["service_tier"].as_str(), Some("flex"));
         assert!(merged.get("model_reasoning_effort").is_none());
         assert!(merged.get("disable_response_storage").is_none());
-        assert_eq!(merged["features"]["js_repl"].as_bool(), Some(false));
+        assert_eq!(merged["features"]["js_repl"].as_bool(), Some(true));
         assert_eq!(
-            merged["mcp_servers"]["live"]["command"].as_str(),
-            Some("live-server")
+            merged["mcp_servers"]["stale"]["command"].as_str(),
+            Some("stale-server")
         );
-        assert!(merged["mcp_servers"].get("stale").is_none());
+        assert!(merged["mcp_servers"].get("live").is_none());
         assert_eq!(
-            merged["projects"]["/live/project"]["trust_level"].as_str(),
-            Some("trusted")
+            merged["projects"]["/stale/project"]["trust_level"].as_str(),
+            Some("untrusted")
         );
-        assert!(merged["projects"].get("/stale/project").is_none());
+        assert!(merged["projects"].get("/live/project").is_none());
         assert_eq!(
             merged["model_providers"]["custom"]["name"].as_str(),
             Some("Provider B")
@@ -1136,10 +1278,10 @@ trust_level = "untrusted"
             merged["model_providers"]["custom"]["request_max_retries"].as_integer(),
             Some(9)
         );
-        assert_eq!(
-            merged["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-            Some("sk-b")
-        );
+        assert!(merged["model_providers"]["custom"]
+            .get("experimental_bearer_token")
+            .is_none());
+        assert_eq!(api_key.as_deref(), Some("sk-b"));
         assert!(!text.contains("sk-a"));
         assert!(!text.contains("sk-stale-template"));
     }
@@ -1264,12 +1406,8 @@ command = "docs-server"
             ensure_table(doc.as_table_mut(), "mcp_servers").expect("create MCP provider table");
         let docs = ensure_table(mcp_servers, "docs").expect("create MCP docs table");
         docs["command"] = value("docs-server");
-        set_provider_bearer_token(&mut doc, token);
         write_text(&config_path(codex_dir), &doc.to_string()).expect("write live config");
-        let auth = json!({
-            "auth_mode": "chatgpt",
-            "tokens": {"access_token": format!("official-{token}")}
-        });
+        let auth = json!({"OPENAI_API_KEY": token});
         write_json(&auth_path(codex_dir), &auth).expect("write live auth");
         auth
     }
@@ -1291,7 +1429,7 @@ command = "docs-server"
         let codex_dir = active_provider_test_dir("success", tag);
         let original = active_provider_fixture(tag, &id, "Before", "model-before", "sk-before");
         save_provider_inner(original.clone()).expect("save original provider");
-        let official_auth = write_active_provider_files(&codex_dir, &original);
+        write_active_provider_files(&codex_dir, &original);
 
         let mut updated = original.clone();
         updated.provider_name = "After".to_string();
@@ -1313,16 +1451,15 @@ command = "docs-server"
             doc["mcp_servers"]["docs"]["command"].as_str(),
             Some("docs-server")
         );
-        assert_eq!(
-            doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-            Some("sk-after")
-        );
+        assert!(doc["model_providers"]["custom"]
+            .get("experimental_bearer_token")
+            .is_none());
         assert_eq!(saved_provider(&id).provider_name, "After");
         let auth_after: Value = serde_json::from_str(
             &fs::read_to_string(auth_path(&codex_dir)).expect("read official auth"),
         )
         .expect("parse official auth");
-        assert_eq!(auth_after, official_auth);
+        assert_eq!(auth_after, json!({"OPENAI_API_KEY": "sk-after"}));
         let delete_error = delete_saved_provider_inner(&id, Some(codex_dir.display().to_string()))
             .expect_err("active provider deletion must be blocked");
         assert!(delete_error.to_string().contains("不能直接删除当前启用"));
@@ -1371,42 +1508,48 @@ command = "docs-server"
     }
 
     #[test]
-    fn provider_switch_rolls_back_live_config_when_final_state_build_fails() {
+    fn provider_switch_rolls_back_config_when_auth_changes_concurrently() {
         let tag = 30_004;
         let codex_dir = active_provider_test_dir("post-write-state-failure", tag);
         let original =
             active_provider_fixture(tag, "custom", "Before", "model-before", "sk-before");
         write_active_provider_files(&codex_dir, &original);
-        fs::write(auth_path(&codex_dir), b"{malformed-auth").expect("write malformed live auth");
         let config_before = fs::read(config_path(&codex_dir)).expect("snapshot live config");
+        let external_auth = json!({"OPENAI_API_KEY": "external-change"});
 
-        let error = switch_provider_inner(ProviderInput {
-            config_dir: Some(codex_dir.display().to_string()),
-            provider_id: Some("next".to_string()),
-            provider_name: "Next".to_string(),
-            base_url: "https://next.example.com/v1".to_string(),
-            model: "model-next".to_string(),
-            api_key: Some("sk-next".to_string()),
-            wire_api: Some("responses".to_string()),
-            requires_openai_auth: Some(false),
-        })
-        .expect_err("malformed auth must fail final state construction");
+        let error = switch_provider_with_pre_persist(
+            ProviderInput {
+                config_dir: Some(codex_dir.display().to_string()),
+                provider_id: Some("next".to_string()),
+                provider_name: "Next".to_string(),
+                base_url: "https://next.example.com/v1".to_string(),
+                model: "model-next".to_string(),
+                api_key: Some("sk-next".to_string()),
+                wire_api: Some("responses".to_string()),
+                requires_openai_auth: Some(false),
+            },
+            |dir| write_json(&auth_path(dir), &external_auth),
+        )
+        .expect_err("stale auth write must roll config back");
 
-        assert!(error.to_string().contains("auth.json"));
+        assert!(error.to_string().contains("已被其他程序修改"));
         assert_eq!(
             fs::read(config_path(&codex_dir)).expect("read rolled back live config"),
             config_before
         );
         assert_eq!(
-            fs::read(auth_path(&codex_dir)).expect("read preserved malformed auth"),
-            b"{malformed-auth"
+            serde_json::from_slice::<Value>(
+                &fs::read(auth_path(&codex_dir)).expect("read external auth")
+            )
+            .expect("parse external auth"),
+            external_auth
         );
 
         fs::remove_dir_all(codex_dir).expect("remove state failure test directory");
     }
 
     #[test]
-    fn active_provider_edit_rolls_back_database_and_live_config_after_state_failure() {
+    fn active_provider_edit_repairs_malformed_auth_and_updates_database() {
         let _db_guard = crate::app_db::test_db_guard();
         let tag = 30_005;
         let id = format!("active-post-write-rollback-{tag}");
@@ -1415,27 +1558,28 @@ command = "docs-server"
         save_provider_inner(original.clone()).expect("save original provider");
         write_active_provider_files(&codex_dir, &original);
         fs::write(auth_path(&codex_dir), b"{malformed-auth").expect("write malformed live auth");
-        let config_before = fs::read(config_path(&codex_dir)).expect("snapshot live config");
 
         let mut updated = original.clone();
         updated.provider_name = "After".to_string();
         updated.model = "model-after".to_string();
         updated.api_key = Some("sk-after".to_string());
-        let error = save_active_provider_inner(updated, Some(codex_dir.display().to_string()))
-            .expect_err("malformed auth must fail final state construction");
+        let result = save_active_provider_inner(updated, Some(codex_dir.display().to_string()))
+            .expect("provider save should replace malformed auth");
 
-        assert!(error.to_string().contains("auth.json"));
-        let restored = saved_provider(&id);
-        assert_eq!(restored.provider_name, original.provider_name);
-        assert_eq!(restored.model, original.model);
-        assert_eq!(restored.api_key, original.api_key);
+        assert_eq!(result.state.model.as_deref(), Some("model-after"));
+        let saved = saved_provider(&id);
+        assert_eq!(saved.provider_name, "After");
+        assert_eq!(saved.model, "model-after");
+        assert_eq!(saved.api_key.as_deref(), Some("sk-after"));
+        assert!(fs::read_to_string(config_path(&codex_dir))
+            .expect("read updated live config")
+            .contains("model = \"model-after\""));
         assert_eq!(
-            fs::read(config_path(&codex_dir)).expect("read rolled back live config"),
-            config_before
-        );
-        assert_eq!(
-            fs::read(auth_path(&codex_dir)).expect("read preserved malformed auth"),
-            b"{malformed-auth"
+            serde_json::from_slice::<Value>(
+                &fs::read(auth_path(&codex_dir)).expect("read repaired auth")
+            )
+            .expect("parse repaired auth"),
+            json!({"OPENAI_API_KEY": "sk-after"})
         );
 
         delete_provider_inner(&id).expect("delete test provider");

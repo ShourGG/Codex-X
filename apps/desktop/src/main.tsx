@@ -198,7 +198,7 @@ const dict = {
       model: "模型",
       wireApi: "Wire API",
       apiKey: "API Key",
-      apiKeyPlaceholder: "留空则不覆盖 auth.json",
+      apiKeyPlaceholder: "用于写入 auth.json",
       requiresAuth: "requires_openai_auth",
       save: "保存到列表",
       saveAndSwitch: "保存",
@@ -299,7 +299,7 @@ const dict = {
       model: "Model",
       wireApi: "Wire API",
       apiKey: "API Key",
-      apiKeyPlaceholder: "Leave blank to keep auth.json unchanged",
+      apiKeyPlaceholder: "Written to auth.json",
       requiresAuth: "requires_openai_auth",
       save: "Save",
       saveAndSwitch: "Save",
@@ -372,6 +372,7 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
     authPathLabel: "auth.json",
     officialCurrentLabel: t.provider.current,
     officialAuthLabel: "auth.json (JSON)",
+    officialTomlLabel: "config.toml (TOML)",
     officialSaveLabel: isChinese ? "保存官方配置" : "Save official config",
     restoreOfficialLabel: isChinese ? "还原官方配置" : "Restore official config",
     resetOfficialLabel: isChinese ? "新建官方配置" : "Create official config",
@@ -404,8 +405,8 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
     requiresAuthLabel: t.provider.requiresAuth,
     authPreviewTitle: "auth.json (JSON)",
     authPreviewDescription: isChinese
-      ? "预览保存时写入或保留的认证配置；API Key 留空不会覆盖现有认证。"
-      : "Preview the authentication data. An empty API key keeps the current auth file.",
+      ? "启用该供应商时，auth.json 只写入 OPENAI_API_KEY；API Key 留空会移除第三方认证文件。"
+      : "When enabled, auth.json contains only OPENAI_API_KEY. Leaving the API key empty removes third-party authentication.",
     tomlTitle: "config.toml (TOML)",
     tomlDescription: isChinese
       ? "上方标准字段是启用时的权威值；已有模板中的其他扩展字段会保留。只有点击“重置生成”才会替换为标准模板。"
@@ -584,9 +585,22 @@ function buildProviderTomlPreview(provider: SavedProvider) {
   ].join("\n");
 }
 
+function buildOfficialTomlPreview(model: string) {
+  return [
+    `model_provider = "custom"`,
+    `model = "${tomlEscape(model.trim() || "gpt-5.5")}"`,
+    "",
+    "[model_providers.custom]",
+    `name = "OpenAI"`,
+    `wire_api = "responses"`,
+    `requires_openai_auth = true`,
+    `supports_websockets = true`,
+  ].join("\n");
+}
+
 function buildProviderAuthPreview(provider: SavedProvider) {
   const key = provider.apiKey?.trim();
-  return JSON.stringify({ OPENAI_API_KEY: key || null, auth_mode: key ? "apikey" : undefined }, null, 2);
+  return JSON.stringify(key ? { OPENAI_API_KEY: key } : {}, null, 2);
 }
 
 function sessionMismatchCount(status: SessionSyncStatus | null) {
@@ -785,12 +799,17 @@ function App() {
   const [promptSyncing, setPromptSyncing] = React.useState(false);
   const [promptCatalogReady, setPromptCatalogReady] = React.useState(false);
   const [promptForm, setPromptForm] = React.useState<SavedPrompt>(blankPromptForm);
-  const [officialForm, setOfficialForm] = React.useState({ model: "gpt-5.5", authJson: "" });
+  const [officialForm, setOfficialForm] = React.useState({
+    model: "gpt-5.5",
+    authJson: "",
+    configText: buildOfficialTomlPreview("gpt-5.5"),
+  });
   const [promptModeHelpOpen, setPromptModeHelpOpen] = React.useState(false);
   const autoUpdateCheckedRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
   const skillZipImportRef = React.useRef<HTMLInputElement | null>(null);
   const officialAuthEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
+  const officialTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const providerTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const providerModelsRequestRef = React.useRef(0);
   const providerDraftRequestRef = React.useRef(0);
@@ -1022,14 +1041,17 @@ function App() {
 
   React.useEffect(() => {
     if (providerMode !== "official") return;
-    const fit = () => fitCodeEditorHeight(officialAuthEditorRef.current, 420);
+    const fit = () => {
+      fitCodeEditorHeight(officialTomlEditorRef.current, 360);
+      fitCodeEditorHeight(officialAuthEditorRef.current, 420);
+    };
     const frame = window.requestAnimationFrame(fit);
     window.addEventListener("resize", fit);
     return () => {
       window.cancelAnimationFrame(frame);
       window.removeEventListener("resize", fit);
     };
-  }, [officialForm.authJson, providerMode]);
+  }, [officialForm.authJson, officialForm.configText, providerMode]);
 
   React.useEffect(() => {
     if (!state || promptModeSyncedRef.current === state.codexDir) return;
@@ -1775,6 +1797,7 @@ function App() {
           setOfficialForm({
             model: draft.model || "gpt-5.5",
             authJson: draft.authJson,
+            configText: draft.configText || buildOfficialTomlPreview(draft.model || "gpt-5.5"),
           });
         }
         handleActionResult(result);
@@ -1788,6 +1811,7 @@ function App() {
           configDir: configDir || null,
           model: officialForm.model,
           authJson: null,
+          configText: officialForm.configText,
         },
       }),
       (result) => {
@@ -1796,6 +1820,9 @@ function App() {
         setOfficialForm({
           model: result.state.model || officialForm.model || "gpt-5.5",
           authJson: officialAuthPlaceholder,
+          configText: result.state.configText
+            || officialForm.configText
+            || buildOfficialTomlPreview(result.state.model || officialForm.model || "gpt-5.5"),
         });
         handleActionResult(result);
       },
@@ -2093,10 +2120,14 @@ function App() {
     const actionToken = beginActionBusy("loadOfficialDraft");
     const liveIsOfficial = Boolean(state?.isOfficialProvider);
     const fallbackModel = state?.model || "gpt-5.5";
+    const fallbackConfigText = liveIsOfficial && state?.configText?.trim()
+      ? state.configText
+      : "";
     setEditingDetectedProvider(false);
     setOfficialForm({
       model: fallbackModel,
       authJson: liveIsOfficial && state?.authText ? state.authText : officialAuthPlaceholder,
+      configText: fallbackConfigText,
     });
     setProviderMode("official");
     setError("");
@@ -2109,6 +2140,7 @@ function App() {
         setOfficialForm({
           model: draft.model || fallbackModel,
           authJson: draft.authJson,
+          configText: draft.configText || fallbackConfigText,
         });
       }
     } catch (e) {
@@ -2126,6 +2158,7 @@ function App() {
             configDir: configDir || null,
             model: officialForm.model,
             authJson: officialForm.authJson,
+            configText: officialForm.configText,
           },
         }),
       (result) => {
@@ -2462,6 +2495,7 @@ function App() {
                 }}
                 officialForm={officialForm}
                 officialAuthRef={officialAuthEditorRef}
+                officialTomlRef={officialTomlEditorRef}
                 officialInfo={{
                   officialUrl: "https://chatgpt.com/codex",
                   authPath: state.authPath,
@@ -2519,6 +2553,7 @@ function App() {
                 }}
                 onOfficialModelChange={(value) => setOfficialForm((current) => ({ ...current, model: value }))}
                 onOfficialAuthChange={(value) => setOfficialForm((current) => ({ ...current, authJson: value }))}
+                onOfficialConfigChange={(value) => setOfficialForm((current) => ({ ...current, configText: value }))}
                 onSaveOfficial={saveOfficialConfig}
                 onApiKeyChange={(value) => {
                   resetAvailableProviderModels();

@@ -54,6 +54,7 @@ export type ProviderFormValue = {
 export type OfficialFormValue = {
   model: string;
   authJson: string;
+  configText: string;
 };
 
 export type ProviderCopy = {
@@ -81,6 +82,7 @@ export type ProviderCopy = {
   authPathLabel: string;
   officialCurrentLabel: string;
   officialAuthLabel: string;
+  officialTomlLabel: string;
   officialSaveLabel: string;
   restoreOfficialLabel: string;
   resetOfficialLabel: string;
@@ -134,6 +136,7 @@ export type ProvidersPageProps = {
   providerForm: ProviderFormValue;
   officialForm: OfficialFormValue;
   officialAuthRef?: Ref<HTMLTextAreaElement>;
+  officialTomlRef?: Ref<HTMLTextAreaElement>;
   officialInfo: ProviderOfficialInfo;
   providerAuthPreview: ReactNode;
   providerTomlDraft: string;
@@ -152,6 +155,7 @@ export type ProvidersPageProps = {
   onCancelMode: () => void;
   onOfficialModelChange: (value: string) => void;
   onOfficialAuthChange: (value: string) => void;
+  onOfficialConfigChange: (value: string) => void;
   onSaveOfficial: () => void;
   onApiKeyChange: (value: string) => void;
   onBaseUrlChange: (value: string) => void;
@@ -395,16 +399,18 @@ function OfficialForm({
   copy,
   officialForm,
   officialAuthRef,
+  officialTomlRef,
   officialInfo,
   loading,
   actionBusy,
   onCancelMode,
   onOfficialModelChange,
   onOfficialAuthChange,
+  onOfficialConfigChange,
   onSaveOfficial,
   onRestoreOfficial,
   onResetOfficial,
-}: Pick<ProvidersPageProps, "copy" | "officialForm" | "officialAuthRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialModelChange" | "onOfficialAuthChange" | "onSaveOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
+}: Pick<ProvidersPageProps, "copy" | "officialForm" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const formBusy = loading || actionBusy === "loadOfficialDraft";
 
@@ -424,6 +430,16 @@ function OfficialForm({
       <div className="cx-providers-form-grid cx-providers-form-grid--single">
         <Field label={copy.modelLabel}><input value={officialForm.model} onChange={(event) => onOfficialModelChange(event.target.value)} disabled={formBusy} /></Field>
       </div>
+      <Field label={copy.officialTomlLabel} className="cx-providers-editor-field">
+        <textarea
+          ref={officialTomlRef}
+          className="cx-providers-code-editor cx-providers-toml-editor"
+          value={officialForm.configText}
+          onChange={(event) => onOfficialConfigChange(event.target.value)}
+          disabled={formBusy}
+          spellCheck={false}
+        />
+      </Field>
       <Field label={copy.officialAuthLabel} className="cx-providers-editor-field">
         <textarea
           ref={officialAuthRef}
@@ -460,7 +476,7 @@ function OfficialForm({
       >
         <div className="cx-provider-delete-warning">
           <span aria-hidden="true"><AlertTriangle size={22} /></span>
-          <strong>auth.json</strong>
+          <strong>config.toml + auth.json</strong>
         </div>
       </ModalShell>
     </>

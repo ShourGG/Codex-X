@@ -4,6 +4,12 @@ All notable changes to Codex-X will be documented here.
 
 ## [Unreleased]
 
+## [v0.3.10] - 2026-08-11
+
+### 更新
+
+- 优化了软件的流畅度和部分 bug。
+
 ## [v0.3.9] - 2026-08-11
 
 ### 更新

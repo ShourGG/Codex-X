@@ -67,7 +67,13 @@ fn redacted_auth_preview(path: &Path) -> Result<Option<Value>> {
         return Ok(None);
     }
     let text = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
-    let mut value: Value = serde_json::from_str(&text).map_err(|e| json_err(path, e))?;
+    // Keep the UI responsive when another tool or an interrupted write leaves
+    // auth.json malformed. Mutating flows validate or replace auth explicitly;
+    // the read-only state path should still report the rest of the config.
+    let mut value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
     if let Some(obj) = value.as_object_mut() {
         for (key, val) in obj.iter_mut() {
             let lower = key.to_ascii_lowercase();

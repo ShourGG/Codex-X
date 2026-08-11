@@ -8,13 +8,19 @@
 
 日志不得包含 Token、认证文件内容、用户数据或仅适用于某台电脑的隐私路径。
 
-## 2026-08-11：供应商模板完整性与启动读取
+## 2026-08-11：供应商认证往返、模板完整性与启动读取
 
 ### 决策
 
-- 新建和 CC Switch 导入的供应商保存完整、无密钥的 TOML 模板；API Key 单独保存。
-- 激活模板时以最新 live `config.toml` 为底稿，只替换 model/provider 字段，不能回放模板里的
-  项目、插件、MCP、桌面或环境设置。
+- 新建和 CC Switch 导入的供应商保存完整、无密钥的 TOML 模板；API Key 单独保存在供应商
+  数据库字段中。完整模板是该供应商的权威配置，切换时恢复项目、插件、MCP、桌面、功能和
+  环境设置；旧版稀疏模板仍以当前 live 配置为底稿兼容合并。
+- 默认切换行为对齐 CC Switch 的非“保留官方登录”路径：第三方 live `auth.json` 只写
+  `OPENAI_API_KEY`，不写 `auth_mode`；live TOML 不保留 `experimental_bearer_token`。
+- 官方配置独立保存完整 `config.toml`、模型和 OAuth/API Key `auth.json`。官方与第三方往返
+  同时原子更新 config/auth，失败时回滚；未登录的官方 Reset 快照也必须保留完整 TOML。
+- 兼容无 `auth_mode` 但包含有效 token、且不含 API Key 的旧版官方 OAuth；损坏的 live
+  `auth.json` 不阻塞状态读取或被新供应商认证覆盖，但绝不能被晋升为官方认证快照。
 - 启动状态读取不得迁移提示词、修改文件权限、捕获认证或扫描历史备份；概览在结果返回前显示
   “正在读取”，失败后显示“读取失败”。
 - Codex-X 内部数据库使用持久 `user_version`。已升级数据库的普通打开只读版本号；迁移、历史
@@ -22,7 +28,8 @@
 - Codex 版本探测在 blocking worker 中执行，固定候选先探测，目录候选流式探测，所有阶段共享
   同一个总 deadline，避免 Windows 慢盘或重定向用户目录拖住启动。
 - 对照 CC Switch `8673e9d8d8508b89c48056523c5f86e7916b4c3c` 的完整 provider config
-  存储与官方 `auth.json` 保留策略；Codex-X 额外保留 live 配置的并发检查与原子回滚。
+  存储与默认 auth/config 写入路径；Codex-X 额外保留官方独立快照、live 配置的并发检查与
+  原子回滚。本节决策替代 2026-07-29 中关于第三方 bearer token 和模板激活的旧约束。
 
 ## 2026-07-30：live 配置并发与失败回滚
 

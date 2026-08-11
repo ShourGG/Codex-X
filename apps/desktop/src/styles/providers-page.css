@@ -714,6 +714,10 @@
   min-height: 360px;
 }
 
+.cx-providers-editor-field + .cx-providers-editor-field {
+  margin-top: 14px;
+}
+
 .cx-providers-form-actions {
   padding: 2px 0 4px;
 }

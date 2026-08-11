@@ -106,6 +106,7 @@ export type ActionResult = {
 
 export type OfficialConfigDraft = {
   authJson: string;
+  configText: string;
   model?: string;
   source: string;
 };
