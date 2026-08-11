@@ -1,7 +1,7 @@
 use super::{
     consolidate_legacy_provider_duplicates_on_connection, custom_provider_id,
     experimental_bearer_token_from_doc, list_saved_providers_on_connection,
-    normalize_saved_provider, open_store, provider_template_from_document,
+    normalize_saved_provider, open_store, strip_provider_bearer_tokens,
     upsert_ccswitch_provider_on_connection, ProviderUpsertKind, SavedProvider,
 };
 use crate::ccswitch::{ccswitch_db_candidates, default_ccswitch_db_path};
@@ -267,16 +267,26 @@ fn ccswitch_provider_template(
         return None;
     }
 
-    doc["model_provider"] = value(provider_id);
-    doc["model"] = value(model);
+    if string_value(&doc, "model_provider").as_deref() != Some(provider_id) {
+        doc["model_provider"] = value(provider_id);
+    }
+    if string_value(&doc, "model").as_deref() != Some(model) {
+        doc["model"] = value(model);
+    }
     let providers = ensure_table(doc.as_table_mut(), "model_providers").ok()?;
-    let mut table = section.provider_table.clone();
-    table["name"] = value(provider_name);
-    table["base_url"] = value(section.base_url.clone());
-    table["wire_api"] = value(section.wire_api.clone());
-    table["requires_openai_auth"] = value(section.requires_openai_auth);
-    providers.insert(provider_id, Item::Table(table));
-    provider_template_from_document(&doc, provider_id, model).ok()
+    if providers
+        .get(provider_id)
+        .and_then(|item| item.as_table())
+        .is_none()
+    {
+        let mut table = section.provider_table.clone();
+        if table_string(&table, "name").is_none() && !provider_name.trim().is_empty() {
+            table["name"] = value(provider_name.trim());
+        }
+        providers.insert(provider_id, Item::Table(table));
+    }
+    strip_provider_bearer_tokens(&mut doc);
+    Some(doc.to_string().trim_end().to_string())
 }
 
 pub(crate) fn build_ccswitch_codex_provider(
@@ -286,15 +296,15 @@ pub(crate) fn build_ccswitch_codex_provider(
     let settings: Value = serde_json::from_str(&row.settings_config).ok()?;
     let section = select_ccswitch_section_for_row(row, &settings, global_sections)?;
     let api_key = ccswitch_auth_api_key(&settings).or(section.experimental_bearer_token.clone());
-    let provider_name = if row.name.trim().is_empty() {
-        section.name.clone().unwrap_or_else(|| row.id.clone())
-    } else {
-        row.name.trim().to_string()
-    };
-    let model = section
-        .model
+    let provider_name = section
+        .name
         .clone()
-        .unwrap_or_else(|| "gpt-5.5".to_string());
+        .or_else(|| {
+            let name = row.name.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .unwrap_or_else(|| row.id.clone());
+    let model = section.model.clone()?;
     let toml_config = ccswitch_provider_template(&settings, &section, &provider_name, &model)?;
     Some(SavedProvider {
         id: custom_provider_id(&row.id),
@@ -517,14 +527,14 @@ mod tests {
             "auth": {"OPENAI_API_KEY": "sk-from-auth"},
             "config": r#"# keep-imported-comment
 model_provider = "custom"
-model = "gpt-5.5"
+model = "gpt-5.6-sol"
 model_reasoning_effort = "xhigh"
 service_tier = "priority"
 experimental_bearer_token = "sk-top-level"
 notify = ["C:\\Users\\Thy\\codex-computer-use.exe", "turn-ended"]
 
 [model_providers.custom]
-name = "Stale name"
+name = "Sky2api"
 base_url = "https://proxy.example.com/v1/"
 wire_api = "responses"
 requires_openai_auth = false
@@ -563,7 +573,7 @@ command = "docs-server"
         .to_string();
         let row = CcSwitchCodexRow {
             id: "magicai-123".to_string(),
-            name: "  MagicAI  ".to_string(),
+            name: "  Sky2_free  ".to_string(),
             settings_config,
             category: None,
         };
@@ -571,9 +581,9 @@ command = "docs-server"
         let provider =
             build_ccswitch_codex_provider(&row, &HashMap::new()).expect("build cc-switch provider");
         assert_eq!(provider.id, "magicai-123");
-        assert_eq!(provider.provider_name, "MagicAI");
+        assert_eq!(provider.provider_name, "Sky2api");
         assert_eq!(provider.base_url, "https://proxy.example.com/v1");
-        assert_eq!(provider.model, "gpt-5.5");
+        assert_eq!(provider.model, "gpt-5.6-sol");
         assert_eq!(provider.api_key.as_deref(), Some("sk-from-auth"));
         assert_eq!(provider.wire_api, "responses");
         assert!(!provider.requires_openai_auth);
@@ -587,11 +597,11 @@ command = "docs-server"
         assert_eq!(doc["notify"].as_array().map(|values| values.len()), Some(2));
         assert_eq!(
             doc["model_providers"]["custom"]["name"].as_str(),
-            Some("MagicAI")
+            Some("Sky2api")
         );
         assert_eq!(
             doc["model_providers"]["custom"]["base_url"].as_str(),
-            Some("https://proxy.example.com/v1")
+            Some("https://proxy.example.com/v1/")
         );
         assert_eq!(
             doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
@@ -635,6 +645,29 @@ command = "docs-server"
                 .is_none_or(|table| table.get("experimental_bearer_token").is_none())));
         assert!(!text.contains("sk-from-auth"));
         assert!(!text.contains("experimental_bearer_token"));
+    }
+
+    #[test]
+    fn complete_row_without_a_model_is_not_silently_downgraded() {
+        let row = CcSwitchCodexRow {
+            id: "missing-model".to_string(),
+            name: "Database label".to_string(),
+            settings_config: json!({
+                "auth": {"OPENAI_API_KEY": "sk-test"},
+                "config": r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "TOML label"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+            })
+            .to_string(),
+            category: None,
+        };
+
+        assert!(build_ccswitch_codex_provider(&row, &HashMap::new()).is_none());
     }
 
     #[test]

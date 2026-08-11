@@ -86,32 +86,60 @@ pub(crate) fn auth_value_has_material(value: &Value) -> bool {
 }
 
 pub(crate) fn is_chatgpt_auth(value: &Value) -> bool {
-    // Older Codex releases wrote OAuth tokens without auth_mode. Accept that
-    // unambiguous legacy shape, but reject any explicitly non-ChatGPT mode.
-    let chatgpt_mode = match value.get("auth_mode") {
-        None => true,
-        Some(Value::String(mode)) => mode.eq_ignore_ascii_case("chatgpt"),
-        Some(_) => false,
-    };
+    let mode = value.get("auth_mode").and_then(Value::as_str);
     let has_api_key = value
         .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
         .is_some_and(|key| !key.trim().is_empty());
-    chatgpt_mode
-        && !has_api_key
-        && value
-            .get("tokens")
-            .and_then(Value::as_object)
-            .is_some_and(|tokens| {
-                ["access_token", "refresh_token", "id_token"]
-                    .iter()
-                    .any(|key| {
-                        tokens
-                            .get(*key)
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| !value.trim().is_empty())
-                    })
+    let has_bedrock_key = value.get("bedrock_api_key").is_some_and(value_has_material);
+    if has_api_key || has_bedrock_key {
+        return false;
+    }
+
+    let has_tokens = value
+        .get("tokens")
+        .and_then(Value::as_object)
+        .is_some_and(|tokens| {
+            ["access_token", "refresh_token", "id_token"]
+                .iter()
+                .any(|key| {
+                    tokens
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|token| !token.trim().is_empty())
+                })
+        });
+    let has_agent_identity = value.get("agent_identity").is_some_and(|identity| {
+        identity.as_str().is_some_and(|jwt| !jwt.trim().is_empty())
+            || identity.as_object().is_some_and(|record| {
+                ["agent_runtime_id", "agent_private_key"].iter().all(|key| {
+                    record
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
             })
+    });
+    let has_personal_access_token = value
+        .get("personal_access_token")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty());
+
+    match mode {
+        // This matches Codex AuthDotJson::resolved_mode: legacy token files
+        // default to ChatGPT, while PAT infers its own mode. Agent Identity
+        // requires an explicit auth_mode.
+        None => has_tokens || has_personal_access_token,
+        Some(mode)
+            if mode.eq_ignore_ascii_case("chatgpt")
+                || mode.eq_ignore_ascii_case("chatgptAuthTokens") =>
+        {
+            has_tokens
+        }
+        Some(mode) if mode.eq_ignore_ascii_case("agentIdentity") => has_agent_identity,
+        Some(mode) if mode.eq_ignore_ascii_case("personalAccessToken") => has_personal_access_token,
+        Some(_) => false,
+    }
 }
 
 fn has_openai_api_key(value: &Value) -> bool {
@@ -753,6 +781,31 @@ mod tests {
         assert!(!is_chatgpt_auth(&json!({
             "tokens": {"access_token": "legacy-access"},
             "OPENAI_API_KEY": "sk-third-party"
+        })));
+        assert!(is_chatgpt_auth(&json!({
+            "auth_mode": "chatgptAuthTokens",
+            "tokens": {"access_token": "external-access"}
+        })));
+        assert!(is_chatgpt_auth(&json!({
+            "auth_mode": "agentIdentity",
+            "agent_identity": {
+                "agent_runtime_id": "runtime-id",
+                "agent_private_key": "private-key"
+            }
+        })));
+        assert!(is_chatgpt_auth(&json!({
+            "auth_mode": "personalAccessToken",
+            "personal_access_token": "pat-test"
+        })));
+        assert!(!is_chatgpt_auth(&json!({
+            "auth_mode": "bedrockApiKey",
+            "bedrock_api_key": {"api_key": "bedrock-test", "region": "us-east-1"}
+        })));
+        assert!(!is_chatgpt_auth(&json!({
+            "agent_identity": {
+                "agent_runtime_id": "runtime-id",
+                "agent_private_key": "private-key"
+            }
         })));
     }
 

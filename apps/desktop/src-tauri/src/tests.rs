@@ -1526,7 +1526,7 @@ description: Keep long investigations aligned.
 }
 
 #[test]
-fn switch_provider_round_trip_preserves_chatgpt_auth_and_scopes_provider_key() {
+fn switch_provider_round_trip_replaces_live_auth_and_restores_official_snapshot() {
     let codex_dir = temp_codex_dir("switch-provider");
     let official_auth = json!({
         "OPENAI_API_KEY": null,
@@ -1537,7 +1537,6 @@ fn switch_provider_round_trip_preserves_chatgpt_auth_and_scopes_provider_key() {
         "last_refresh": "2026-07-24T00:00:00Z"
     });
     write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
-    let official_auth_bytes = fs::read(auth_path(&codex_dir)).expect("snapshot official auth");
     let switch_to_magic = || {
         switch_provider_inner(ProviderInput {
             config_dir: Some(codex_dir.display().to_string()),
@@ -1566,15 +1565,14 @@ fn switch_provider_round_trip_preserves_chatgpt_auth_and_scopes_provider_key() {
         .parse::<DocumentMut>()
         .expect("parse switched config");
     assert!(config_doc.get("experimental_bearer_token").is_none());
-    assert_eq!(
-        config_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-test")
-    );
-
-    assert_eq!(
-        fs::read(auth_path(&codex_dir)).expect("read auth after provider switch"),
-        official_auth_bytes
-    );
+    assert!(config_doc["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
+    let provider_auth: Value = serde_json::from_slice(
+        &fs::read(auth_path(&codex_dir)).expect("read auth after provider switch"),
+    )
+    .expect("parse provider auth");
+    assert_eq!(provider_auth, json!({"OPENAI_API_KEY": "sk-test"}));
 
     let official = switch_official_provider_inner(Some(codex_dir.display().to_string()))
         .expect("switch back to official");
@@ -1602,15 +1600,279 @@ fn switch_provider_round_trip_preserves_chatgpt_auth_and_scopes_provider_key() {
         final_doc["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
         Some(true)
     );
+    assert!(final_doc["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
+    let final_auth: Value =
+        serde_json::from_slice(&fs::read(auth_path(&codex_dir)).expect("read final provider auth"))
+            .expect("parse final provider auth");
+    assert_eq!(final_auth, json!({"OPENAI_API_KEY": "sk-test"}));
+
+    let snapshot_path = providers::official_snapshot_path_for_test(&codex_dir)
+        .expect("resolve official snapshot path");
+    let _ = fs::remove_file(snapshot_path);
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn third_party_auth_shapes_round_trip_to_pure_key_and_complete_toml() {
+    let _db_guard = crate::app_db::test_db_guard();
+    let cases = [
+        ("key-only", json!({"OPENAI_API_KEY": "sk-provider"})),
+        (
+            "legacy-auth-mode",
+            json!({"OPENAI_API_KEY": "sk-provider", "auth_mode": "apikey"}),
+        ),
+    ];
+
+    for (label, initial_provider_auth) in cases {
+        let codex_dir = temp_codex_dir(&format!("third-party-auth-round-trip-{label}"));
+        let official_config = r#"model_provider = "openai"
+model = "official-model"
+"#;
+        let official_auth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "official-access-token",
+                "refresh_token": "official-refresh-token"
+            }
+        });
+        write_text(&config_path(&codex_dir), official_config).expect("write official config");
+        write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
+        assert!(
+            providers::capture_live_chatgpt_config(&codex_dir).expect("capture official snapshot")
+        );
+
+        let provider_config = r#"# preserve-provider-template
+model_provider = "custom"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+service_tier = "priority"
+disable_response_storage = true
+notify = ["C:\\Tools\\notify.exe", "turn-ended"]
+
+[model_providers.custom]
+name = "Round Trip Proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "sk-legacy-scoped"
+request_max_retries = 11
+
+[desktop]
+followUpQueueMode = "queue"
+localeOverride = "zh-CN"
+
+[features]
+js_repl = false
+"#;
+        write_text(&config_path(&codex_dir), provider_config).expect("write provider config");
+        write_json(&auth_path(&codex_dir), &initial_provider_auth)
+            .expect("write initial provider auth");
+
+        let official = switch_official_provider_inner(Some(codex_dir.display().to_string()))
+            .expect("switch provider to official");
+        assert!(official.state.is_official_provider, "case {label}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(auth_path(&codex_dir)).expect("read restored official auth")
+            )
+            .expect("parse restored official auth"),
+            official_auth,
+            "case {label}"
+        );
+
+        let provider = save_provider_toml_config_inner(ProviderTomlInput {
+            config_dir: Some(codex_dir.display().to_string()),
+            config_text: provider_config.to_string(),
+            api_key: Some("sk-provider".to_string()),
+        })
+        .expect("switch official back to provider");
+        assert!(!provider.state.is_official_provider, "case {label}");
+        assert_eq!(provider.state.model.as_deref(), Some("gpt-5.6-sol"));
+
+        let final_auth: Value = serde_json::from_slice(
+            &fs::read(auth_path(&codex_dir)).expect("read final provider auth"),
+        )
+        .expect("parse final provider auth");
+        assert_eq!(
+            final_auth,
+            json!({"OPENAI_API_KEY": "sk-provider"}),
+            "case {label}"
+        );
+
+        let final_config =
+            fs::read_to_string(config_path(&codex_dir)).expect("read final provider config");
+        let final_doc = final_config
+            .parse::<DocumentMut>()
+            .expect("parse final provider config");
+        assert!(final_config.contains("# preserve-provider-template"));
+        assert_eq!(final_doc["model"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(final_doc["model_reasoning_effort"].as_str(), Some("xhigh"));
+        assert_eq!(final_doc["service_tier"].as_str(), Some("priority"));
+        assert_eq!(
+            final_doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
+            Some(11)
+        );
+        assert_eq!(
+            final_doc["desktop"]["followUpQueueMode"].as_str(),
+            Some("queue")
+        );
+        assert_eq!(
+            final_doc["desktop"]["localeOverride"].as_str(),
+            Some("zh-CN")
+        );
+        assert_eq!(final_doc["features"]["js_repl"].as_bool(), Some(false));
+        assert!(!final_config.contains("experimental_bearer_token"));
+
+        let snapshot_path = providers::official_snapshot_path_for_test(&codex_dir)
+            .expect("resolve official snapshot path");
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+}
+
+#[test]
+fn saved_provider_a_to_official_to_saved_provider_b_uses_provider_b_auth() {
+    let _db_guard = crate::app_db::test_db_guard();
+    let codex_dir = temp_codex_dir("saved-provider-a-official-b");
+    let suffix = Local::now().timestamp_nanos_opt().unwrap_or_default();
+    let provider_a_id = format!("roundtrip-a-{suffix}");
+    let provider_b_id = format!("roundtrip-b-{suffix}");
+    let official_config = r#"model_provider = "openai"
+model = "official-model"
+"#;
+    let official_auth = json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": "official-access-token",
+            "refresh_token": "official-refresh-token"
+        }
+    });
+    let provider_a_config = r#"model_provider = "custom"
+model = "proxy-model-a"
+
+[model_providers.custom]
+name = "Proxy A"
+base_url = "https://a.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+    let provider_b_config = r#"# keep-provider-b-template
+model_provider = "custom"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+service_tier = "priority"
+
+[model_providers.custom]
+name = "Proxy B"
+base_url = "https://b.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+request_max_retries = 9
+
+[desktop]
+localeOverride = "zh-CN"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"#;
+
+    write_text(&config_path(&codex_dir), official_config).expect("write official config");
+    write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
+    assert!(providers::capture_live_chatgpt_config(&codex_dir).expect("capture official snapshot"));
+
+    for provider in [
+        SavedProvider {
+            id: provider_a_id.clone(),
+            provider_name: "Proxy A".to_string(),
+            base_url: "https://a.example.com/v1".to_string(),
+            model: "proxy-model-a".to_string(),
+            api_key: Some("sk-provider-a".to_string()),
+            toml_config: Some(provider_a_config.to_string()),
+            wire_api: "responses".to_string(),
+            requires_openai_auth: true,
+        },
+        SavedProvider {
+            id: provider_b_id.clone(),
+            provider_name: "Proxy B".to_string(),
+            base_url: "https://b.example.com/v1".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            api_key: Some("sk-provider-b".to_string()),
+            toml_config: Some(provider_b_config.to_string()),
+            wire_api: "responses".to_string(),
+            requires_openai_auth: true,
+        },
+    ] {
+        save_provider_inner(provider).expect("save provider record");
+    }
+
+    save_provider_toml_config_inner(ProviderTomlInput {
+        config_dir: Some(codex_dir.display().to_string()),
+        config_text: provider_a_config.to_string(),
+        api_key: Some("sk-provider-a".to_string()),
+    })
+    .expect("activate provider A");
+    write_json(
+        &auth_path(&codex_dir),
+        &json!({"OPENAI_API_KEY": "sk-provider-a", "auth_mode": "apikey"}),
+    )
+    .expect("simulate legacy provider auth shape");
+
+    let official = switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("switch provider A to official");
+    assert!(official.state.is_official_provider);
     assert_eq!(
-        final_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-test")
-    );
-    assert_eq!(
-        fs::read(auth_path(&codex_dir)).expect("read final provider auth"),
-        official_auth_bytes
+        serde_json::from_slice::<Value>(
+            &fs::read(auth_path(&codex_dir)).expect("read restored official auth")
+        )
+        .expect("parse restored official auth"),
+        official_auth
     );
 
+    let provider_b = list_saved_providers_inner()
+        .expect("list saved providers")
+        .into_iter()
+        .find(|provider| provider.id == provider_b_id)
+        .expect("find saved provider B");
+    let switched = save_provider_toml_config_inner(ProviderTomlInput {
+        config_dir: Some(codex_dir.display().to_string()),
+        config_text: provider_b.toml_config.expect("provider B complete TOML"),
+        api_key: provider_b.api_key,
+    })
+    .expect("switch official to saved provider B");
+
+    assert_eq!(switched.message, "已切换到 Proxy B");
+    assert!(!switched.state.is_official_provider);
+    assert_eq!(switched.state.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &fs::read(auth_path(&codex_dir)).expect("read final provider B auth")
+        )
+        .expect("parse final provider B auth"),
+        json!({"OPENAI_API_KEY": "sk-provider-b"})
+    );
+    let final_config = fs::read_to_string(config_path(&codex_dir)).expect("read provider B config");
+    let final_doc = final_config
+        .parse::<DocumentMut>()
+        .expect("parse provider B config");
+    assert!(final_config.contains("# keep-provider-b-template"));
+    assert_eq!(final_doc["model"].as_str(), Some("gpt-5.6-sol"));
+    assert_eq!(final_doc["model_reasoning_effort"].as_str(), Some("xhigh"));
+    assert_eq!(
+        final_doc["model_providers"]["custom"]["base_url"].as_str(),
+        Some("https://b.example.com/v1")
+    );
+    assert!(final_doc["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
+    assert_eq!(
+        final_doc["plugins"]["browser@openai-bundled"]["enabled"].as_bool(),
+        Some(true)
+    );
+
+    providers::delete_provider_inner(&provider_a_id).expect("delete provider A");
+    providers::delete_provider_inner(&provider_b_id).expect("delete provider B");
     let snapshot_path = providers::official_snapshot_path_for_test(&codex_dir)
         .expect("resolve official snapshot path");
     let _ = fs::remove_file(snapshot_path);
@@ -1732,7 +1994,7 @@ fn polluted_official_live_api_key_does_not_replace_saved_oauth() {
 }
 
 #[test]
-fn switch_provider_pre_switch_hook_observes_current_before_scoping_next_key() {
+fn switch_provider_pre_switch_hook_observes_current_before_replacing_auth() {
     let codex_dir = temp_codex_dir("switch-provider-persist-current");
     write_text(
         &config_path(&codex_dir),
@@ -1810,16 +2072,15 @@ command = "docs-server"
         &fs::read_to_string(auth_path(&codex_dir)).expect("read provider B auth"),
     )
     .expect("parse provider B auth");
-    assert_eq!(live_auth, official_auth);
+    assert_eq!(live_auth, json!({"OPENAI_API_KEY": "sk-b"}));
     let live_doc = result
         .state
         .config_text
         .parse::<DocumentMut>()
         .expect("parse provider B live config");
-    assert_eq!(
-        live_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-b")
-    );
+    assert!(live_doc["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
 
     let _ = fs::remove_dir_all(codex_dir);
 }
@@ -1847,10 +2108,9 @@ fn switch_provider_reserved_builtin_ids_still_write_live_custom() {
     let config_doc = config_text
         .parse::<DocumentMut>()
         .expect("parse reserved-id provider config");
-    assert_eq!(
-        config_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-proxy")
-    );
+    assert!(config_doc["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
     let provider_auth: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read provider auth"),
     )
@@ -2332,10 +2592,10 @@ command = "docs-server"
     switch_to_proxy().expect("switch from complete official config to proxy");
     assert_eq!(
         serde_json::from_str::<Value>(
-            &fs::read_to_string(auth_path(&codex_dir)).expect("read preserved OAuth auth")
+            &fs::read_to_string(auth_path(&codex_dir)).expect("read proxy auth")
         )
-        .expect("parse preserved OAuth auth"),
-        official_auth
+        .expect("parse proxy auth"),
+        json!({"OPENAI_API_KEY": "sk-proxy"})
     );
 
     switch_official_provider_inner(Some(codex_dir.display().to_string()))
@@ -2361,16 +2621,15 @@ command = "docs-server"
     let final_proxy = final_proxy
         .parse::<DocumentMut>()
         .expect("parse final proxy config");
-    assert_eq!(
-        final_proxy["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-proxy")
-    );
+    assert!(final_proxy["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
     assert_eq!(
         serde_json::from_str::<Value>(
-            &fs::read_to_string(auth_path(&codex_dir)).expect("read final OAuth auth")
+            &fs::read_to_string(auth_path(&codex_dir)).expect("read final proxy auth")
         )
-        .expect("parse final OAuth auth"),
-        official_auth
+        .expect("parse final proxy auth"),
+        json!({"OPENAI_API_KEY": "sk-proxy"})
     );
 
     let _ = fs::remove_file(snapshot_path);
@@ -2493,10 +2752,9 @@ requires_openai_auth = true
         .expect("read restored provider config")
         .parse::<DocumentMut>()
         .expect("parse restored provider config");
-    assert_eq!(
-        restored_provider["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-auth-only")
-    );
+    assert!(restored_provider["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
 
     crate::providers::delete_provider_inner(&provider_id).expect("delete backfill test provider");
     let _ = fs::remove_dir_all(codex_dir);
@@ -2690,10 +2948,10 @@ fn malformed_official_snapshot_does_not_block_state_or_provider_switch() {
     assert_eq!(repaired["auth"], official_auth);
     assert_eq!(
         serde_json::from_str::<Value>(
-            &fs::read_to_string(auth_path(&codex_dir)).expect("read preserved live auth")
+            &fs::read_to_string(auth_path(&codex_dir)).expect("read provider live auth")
         )
-        .expect("parse preserved live auth"),
-        official_auth
+        .expect("parse provider live auth"),
+        json!({"OPENAI_API_KEY": "sk-proxy"})
     );
 
     let _ = fs::remove_file(snapshot_path);
@@ -3093,15 +3351,14 @@ fn reset_then_new_live_oauth_is_detected_and_preserved() {
     let proxy_auth: Value =
         serde_json::from_str(&fs::read_to_string(auth_path(&codex_dir)).expect("read proxy auth"))
             .expect("parse proxy auth");
-    assert_eq!(proxy_auth, fresh_oauth);
+    assert_eq!(proxy_auth, json!({"OPENAI_API_KEY": "sk-proxy"}));
     let proxy_config = fs::read_to_string(config_path(&codex_dir)).expect("read proxy config");
     let proxy_config = proxy_config
         .parse::<DocumentMut>()
         .expect("parse proxy config");
-    assert_eq!(
-        proxy_config["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-proxy")
-    );
+    assert!(proxy_config["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
 
     switch_official_provider_with_pre_persist(Some(codex_dir.display().to_string()), |_| Ok(()))
         .expect("restore fresh official login after proxy");
@@ -3116,7 +3373,7 @@ fn reset_then_new_live_oauth_is_detected_and_preserved() {
         &fs::read_to_string(auth_path(&codex_dir)).expect("read final proxy auth"),
     )
     .expect("parse final proxy auth");
-    assert_eq!(final_proxy_auth, fresh_oauth);
+    assert_eq!(final_proxy_auth, json!({"OPENAI_API_KEY": "sk-proxy"}));
 
     let snapshot_path =
         providers::official_snapshot_path_for_test(&codex_dir).expect("resolve snapshot path");
@@ -3341,7 +3598,7 @@ requires_openai_auth = true
 }
 
 #[test]
-fn save_provider_toml_config_preserves_chatgpt_auth_and_scopes_provider_key() {
+fn save_provider_toml_config_replaces_live_auth_and_restores_official_snapshot() {
     let codex_dir = temp_codex_dir("save-provider-toml-token");
     let official_auth = json!({
         "auth_mode": "chatgpt",
@@ -3373,15 +3630,14 @@ requires_openai_auth = false
     let config_doc = config_text
         .parse::<DocumentMut>()
         .expect("parse provider config");
-    assert_eq!(
-        config_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-provider-table")
-    );
+    assert!(config_doc["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
     let auth_after: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read auth after save"),
     )
     .expect("parse auth after save");
-    assert_eq!(auth_after, official_auth);
+    assert_eq!(auth_after, json!({"OPENAI_API_KEY": "sk-provider-table"}));
 
     switch_official_provider_inner(Some(codex_dir.display().to_string()))
         .expect("restore official auth after TOML provider switch");
@@ -3532,10 +3788,9 @@ command = "must-not-replace-live"
         doc["model_providers"]["custom"]["base_url"].as_str(),
         Some("https://new.example.com/v1")
     );
-    assert_eq!(
-        doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-new")
-    );
+    assert!(doc["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
     let auth: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read merged provider auth"),
     )
@@ -3570,10 +3825,9 @@ experimental_bearer_token = "sk-existing"
     let config = config
         .parse::<DocumentMut>()
         .expect("parse live provider config");
-    assert_eq!(
-        config["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-existing")
-    );
+    assert!(config["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
     let auth: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read migrated provider auth"),
     )
@@ -3638,10 +3892,9 @@ requires_openai_auth = false
         .config_text
         .parse::<DocumentMut>()
         .expect("parse provider B live config");
-    assert_eq!(
-        live_doc["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-        Some("sk-b")
-    );
+    assert!(live_doc["model_providers"]["custom"]
+        .get("experimental_bearer_token")
+        .is_none());
     assert!(!result
         .state
         .config_text

@@ -15,12 +15,13 @@
 - 新建和 CC Switch 导入的供应商保存完整、无密钥的 TOML 模板；API Key 单独保存在供应商
   数据库字段中。完整模板是该供应商的权威配置，切换时恢复项目、插件、MCP、桌面、功能和
   环境设置；旧版稀疏模板仍以当前 live 配置为底稿兼容合并。
-- 有可信 ChatGPT OAuth 时，第三方切换保留 live `auth.json`，并把目标 Key 写入活动
-  provider 的 `experimental_bearer_token`；没有 OAuth 时继续写 `OPENAI_API_KEY` 以维持
-  Codex 登录状态，同时也写 provider 作用域 Key，避免两文件切换窗口使用错凭据。
+- 官方 OAuth 只保存在 Codex-X 的独立可信快照和官方 live `auth.json` 中。切换第三方时，
+  live `auth.json` 改写为只含 `OPENAI_API_KEY` 的第三方认证；第三方 TOML 不保留
+  `auth_mode` 或 `experimental_bearer_token`，切回官方时再恢复完整官方认证。
 - 官方配置独立保存完整 `config.toml`、模型和 OAuth/API Key `auth.json`。官方与第三方往返
-  先发布目标路由，再按需更新 auth，失败时按条件原子回滚；未登录的官方 Reset 快照也必须
-  保留完整 TOML。自动捕获不得让官方 live 中残留的中转 API Key 覆盖可信 OAuth 快照。
+  按目标方向写入：第三方凭据先于第三方路由，官方路由先于官方凭据；失败时只回滚已经写入
+  的第一步。未登录的官方 Reset 快照也必须保留完整 TOML。自动捕获不得让第三方 API Key
+  覆盖可信 OAuth 快照。
 - 兼容无 `auth_mode` 但包含有效 token、且不含 API Key 的旧版官方 OAuth；损坏的 live
   `auth.json` 与损坏的应用内官方快照都不阻塞状态读取或供应商切换，且绝不能被晋升为官方
   认证快照。完整官方 TOML 是模型字段的权威源，独立模型输入只补齐缺失值。
@@ -30,9 +31,10 @@
   清理和版本更新在同一个 `BEGIN IMMEDIATE` 事务完成，失败可重试，同路径替换后可重新初始化。
 - Codex 版本探测在 blocking worker 中执行，固定候选先探测，目录候选流式探测，所有阶段共享
   同一个总 deadline，避免 Windows 慢盘或重定向用户目录拖住启动。
-- 对照 CC Switch `95f2dd41262f01209100128ea647dbd054b5624a` 的完整 provider config、
-  官方登录保留和 provider-scoped bearer token 路径，并用 Codex CLI `0.147.0-alpha.6.5` 的
-  隔离回环请求验证作用域 Key 优先级；
+- 对照 CC Switch `076c2744ceb622b85771bff57668d43ed70809f8` 的完整 provider config 和
+  默认 `preserveCodexOfficialAuthOnSwitch = false` 路径：第三方认证直接写入 `auth.json`。
+  `95f2dd41262f01209100128ea647dbd054b5624a` 的 OAuth + provider-scoped bearer 行为仅作为
+  兼容策略参考，不再作为 Codex-X 默认切换语义；
   Codex-X 额外保留官方独立快照、live 配置并发检查与条件原子回滚。本节决策替代 2026-07-29
   中关于第三方 bearer token 和模板激活的旧约束。
 

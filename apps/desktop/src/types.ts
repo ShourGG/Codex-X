@@ -111,6 +111,13 @@ export type OfficialConfigDraft = {
   source: string;
 };
 
+export type OfficialAuthCandidate = {
+  authJson: string;
+  configText?: string | null;
+  model?: string | null;
+  source: string;
+};
+
 export type ImportResult = {
   imported: number;
   added: number;

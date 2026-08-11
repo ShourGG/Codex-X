@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   CheckCircle2,
+  Download,
   Eye,
   EyeOff,
   FilePlus2,
@@ -84,6 +85,7 @@ export type ProviderCopy = {
   officialAuthLabel: string;
   officialTomlLabel: string;
   officialSaveLabel: string;
+  loadCcSwitchOfficialLabel: string;
   restoreOfficialLabel: string;
   resetOfficialLabel: string;
   resetOfficialTitle: string;
@@ -146,6 +148,7 @@ export type ProvidersPageProps = {
   fetchingModels: boolean;
   onImportCcSwitch: () => void;
   onAddProvider: () => void;
+  onLoadCcSwitchOfficial: () => void;
   onRestoreOfficial: () => void;
   onResetOfficial: () => void;
   onEnableProvider: (row: ProviderRow) => void;
@@ -408,11 +411,13 @@ function OfficialForm({
   onOfficialAuthChange,
   onOfficialConfigChange,
   onSaveOfficial,
+  onLoadCcSwitchOfficial,
   onRestoreOfficial,
   onResetOfficial,
-}: Pick<ProvidersPageProps, "copy" | "officialForm" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
+}: Pick<ProvidersPageProps, "copy" | "officialForm" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
-  const formBusy = loading || actionBusy === "loadOfficialDraft";
+  const loadingCcSwitch = actionBusy === "loadCcSwitchOfficial";
+  const formBusy = loading || actionBusy === "loadOfficialDraft" || loadingCcSwitch;
 
   const confirmReset = () => {
     setResetConfirmOpen(false);
@@ -452,6 +457,12 @@ function OfficialForm({
         />
       </Field>
       <div className="cx-providers-form-actions cx-providers-form-actions--save cx-providers-official-actions">
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCcSwitchOfficial} disabled={formBusy}>
+          {loadingCcSwitch
+            ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" />
+            : <Download size={15} aria-hidden="true" />}
+          {copy.loadCcSwitchOfficialLabel}
+        </button>
         <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onRestoreOfficial} disabled={formBusy}>
           <RotateCcw size={15} aria-hidden="true" />{copy.restoreOfficialLabel}
         </button>

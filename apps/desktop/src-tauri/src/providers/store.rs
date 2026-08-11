@@ -323,7 +323,9 @@ fn stored_providers_on_connection(conn: &Connection) -> Result<Vec<StoredProvide
 
     let mut providers = Vec::new();
     for row in rows {
-        providers.push(row.map_err(|e| CodexxError::Database(e.to_string()))?);
+        let mut stored = row.map_err(|e| CodexxError::Database(e.to_string()))?;
+        normalize_stored_provider_from_toml(&mut stored.provider);
+        providers.push(stored);
     }
     Ok(providers)
 }
@@ -351,7 +353,8 @@ pub(crate) fn provider_by_id_on_connection(
              FROM providers WHERE id = ?1 LIMIT 1",
         )
         .map_err(|e| CodexxError::Database(e.to_string()))?;
-    stmt.query_row([id], saved_provider_from_row)
+    let provider = stmt
+        .query_row([id], saved_provider_from_row)
         .map(Some)
         .or_else(|error| {
             if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
@@ -360,7 +363,11 @@ pub(crate) fn provider_by_id_on_connection(
                 Err(error)
             }
         })
-        .map_err(|e| CodexxError::Database(e.to_string()))
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    Ok(provider.map(|mut provider| {
+        normalize_stored_provider_from_toml(&mut provider);
+        provider
+    }))
 }
 
 fn write_provider_with_origin(
@@ -824,7 +831,91 @@ pub(crate) fn consolidate_legacy_provider_duplicates_on_connection(
     }
 }
 
-fn normalize_provider_toml(provider: &mut SavedProvider) -> Result<()> {
+fn apply_provider_toml_authority(provider: &mut SavedProvider) -> Result<()> {
+    let Some(text) = provider.toml_config.as_deref() else {
+        return Ok(());
+    };
+    let mut doc = text
+        .parse::<DocumentMut>()
+        .map_err(|error| CodexxError::Config(format!("供应商 TOML 无效: {error}")))?;
+    let provider_id = doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| CodexxError::Config("供应商 TOML 缺少 model_provider".to_string()))?;
+
+    let table = doc
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(|item| item.as_table())
+        .ok_or_else(|| {
+            CodexxError::Config(format!("供应商 TOML 缺少 [model_providers.{provider_id}]"))
+        })?;
+
+    let model = doc
+        .get("model")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let provider_name = table
+        .get("name")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let base_url = table
+        .get("base_url")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let wire_api = table
+        .get("wire_api")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let requires_openai_auth = table
+        .get("requires_openai_auth")
+        .and_then(|item| item.as_bool());
+    let toml_api_key = experimental_bearer_token_from_doc(&doc, Some(&provider_id));
+
+    if let Some(model) = model {
+        provider.model = model;
+    }
+    if let Some(provider_name) = provider_name {
+        provider.provider_name = provider_name;
+    }
+    if let Some(base_url) = base_url {
+        provider.base_url = canonical_provider_base_url(&base_url);
+    }
+    if let Some(wire_api) = wire_api {
+        provider.wire_api = wire_api;
+    }
+    if let Some(requires_openai_auth) = requires_openai_auth {
+        provider.requires_openai_auth = requires_openai_auth;
+    }
+    if provider.api_key.is_none() {
+        provider.api_key = toml_api_key;
+    }
+
+    strip_provider_bearer_tokens(&mut doc);
+    provider.toml_config = Some(doc.to_string().trim_end().to_string());
+    Ok(())
+}
+
+fn normalize_stored_provider_from_toml(provider: &mut SavedProvider) {
+    // Old releases could persist stale scalar columns beside a newer complete
+    // TOML template. Reads must trust a valid template without making one bad
+    // legacy row prevent the provider list from loading.
+    let _ = apply_provider_toml_authority(provider);
+}
+
+fn sync_provider_toml_from_fields(provider: &mut SavedProvider) -> Result<()> {
     let Some(text) = provider.toml_config.as_deref() else {
         return Ok(());
     };
@@ -842,7 +933,7 @@ fn normalize_provider_toml(provider: &mut SavedProvider) -> Result<()> {
     if provider.api_key.is_none() {
         provider.api_key = experimental_bearer_token_from_doc(&doc, Some(&provider_id));
     }
-    doc.as_table_mut().remove("experimental_bearer_token");
+    strip_provider_bearer_tokens(&mut doc);
     doc["model"] = value(provider.model.clone());
 
     let table = doc
@@ -857,7 +948,6 @@ fn normalize_provider_toml(provider: &mut SavedProvider) -> Result<()> {
     table["base_url"] = value(provider.base_url.clone());
     table["wire_api"] = value(provider.wire_api.clone());
     table["requires_openai_auth"] = value(provider.requires_openai_auth);
-    table.remove("experimental_bearer_token");
     provider.toml_config = Some(provider_template_from_document(
         &doc,
         &provider_id,
@@ -905,7 +995,11 @@ pub(crate) fn normalize_saved_provider(provider: SavedProvider) -> Result<SavedP
             "供应商名称和 base_url 不能使用示例占位值，请填写实际配置".to_string(),
         ));
     }
-    normalize_provider_toml(&mut normalized)?;
+    // Imported/read records are hydrated from their complete TOML before they
+    // reach this path. For an explicit user edit, the latest form fields win
+    // while the full TOML (comments, MCP, projects, desktop settings, etc.) is
+    // retained verbatim apart from the standard provider fields.
+    sync_provider_toml_from_fields(&mut normalized)?;
     Ok(normalized)
 }
 
@@ -1507,10 +1601,11 @@ enabled = true
     }
 
     #[test]
-    fn provider_toml_keeps_extensions_and_normalizes_standard_fields() {
+    fn provider_toml_keeps_extensions_and_syncs_explicit_field_edits() {
         let mut item = provider("saved", "Edited Name", Some("sk-explicit"));
         item.base_url = "https://edited.example.com/v1/".to_string();
         item.model = "edited-model".to_string();
+        item.wire_api = "chat_completions".to_string();
         item.requires_openai_auth = false;
         item.toml_config = Some(
             r#"model_provider = "proxy"
@@ -1543,6 +1638,11 @@ command = "keep-this-command"
         let normalized = normalize_saved_provider(item).expect("normalize provider TOML");
         let text = normalized.toml_config.as_deref().unwrap();
         let doc = text.parse::<DocumentMut>().expect("parse normalized TOML");
+        assert_eq!(normalized.provider_name, "Edited Name");
+        assert_eq!(normalized.base_url, "https://edited.example.com/v1");
+        assert_eq!(normalized.model, "edited-model");
+        assert_eq!(normalized.wire_api, "chat_completions");
+        assert!(!normalized.requires_openai_auth);
         assert_eq!(doc["model"].as_str(), Some("edited-model"));
         assert_eq!(
             doc["model_providers"]["proxy"]["name"].as_str(),
@@ -1551,6 +1651,10 @@ command = "keep-this-command"
         assert_eq!(
             doc["model_providers"]["proxy"]["base_url"].as_str(),
             Some("https://edited.example.com/v1")
+        );
+        assert_eq!(
+            doc["model_providers"]["proxy"]["wire_api"].as_str(),
+            Some("chat_completions")
         );
         assert_eq!(
             doc["model_providers"]["proxy"]["requires_openai_auth"].as_bool(),
@@ -1584,6 +1688,74 @@ command = "keep-this-command"
                 .is_none_or(|table| table.get("experimental_bearer_token").is_none())));
         assert!(!text.contains("experimental_bearer_token"));
         assert_eq!(normalized.api_key.as_deref(), Some("sk-explicit"));
+    }
+
+    #[test]
+    fn legacy_rows_are_repaired_from_complete_toml_on_read() {
+        let conn = test_connection();
+        let mut legacy = provider("legacy", "Wrong database name", None);
+        legacy.base_url = "https://wrong.example.com/v1".to_string();
+        legacy.model = "wrong-model".to_string();
+        legacy.wire_api = "chat_completions".to_string();
+        legacy.requires_openai_auth = true;
+        legacy.toml_config = Some(
+            r#"# authoritative saved template
+model_provider = "proxy"
+model = "gpt-5.6-sol"
+service_tier = "priority"
+
+[model_providers.proxy]
+name = "Authoritative Name"
+base_url = "https://RIGHT.example.com/v1/"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-from-template"
+request_max_retries = 9
+"#
+            .to_string(),
+        );
+        write_provider_on_connection(&conn, &legacy).expect("seed legacy mismatch");
+
+        let listed = list_saved_providers_on_connection(&conn).expect("read providers");
+        assert_eq!(listed.len(), 1);
+        let repaired = &listed[0];
+        assert_eq!(repaired.provider_name, "Authoritative Name");
+        assert_eq!(repaired.base_url, "https://right.example.com/v1");
+        assert_eq!(repaired.model, "gpt-5.6-sol");
+        assert_eq!(repaired.wire_api, "responses");
+        assert!(!repaired.requires_openai_auth);
+        assert_eq!(repaired.api_key.as_deref(), Some("sk-from-template"));
+        let template = repaired.toml_config.as_deref().expect("saved template");
+        assert!(template.contains("# authoritative saved template"));
+        assert!(template.contains("request_max_retries = 9"));
+        assert!(!template.contains("experimental_bearer_token"));
+
+        let by_id = provider_by_id_on_connection(&conn, "legacy")
+            .expect("read provider by id")
+            .expect("legacy provider");
+        assert_eq!(by_id, *repaired);
+
+        let raw_model: String = conn
+            .query_row(
+                "SELECT model FROM providers WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read raw legacy scalar");
+        assert_eq!(raw_model, "wrong-model");
+    }
+
+    #[test]
+    fn malformed_legacy_toml_does_not_break_provider_reads() {
+        let conn = test_connection();
+        let mut legacy = provider("legacy", "Fallback Name", Some("sk-fallback"));
+        legacy.base_url = "https://fallback.example.com/v1".to_string();
+        legacy.model = "fallback-model".to_string();
+        legacy.toml_config = Some("model = [".to_string());
+        write_provider_on_connection(&conn, &legacy).expect("seed malformed legacy row");
+
+        let listed = list_saved_providers_on_connection(&conn).expect("read malformed legacy row");
+        assert_eq!(listed, vec![legacy]);
     }
 
     #[test]

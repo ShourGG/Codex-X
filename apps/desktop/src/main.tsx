@@ -33,6 +33,7 @@ import type {
   InstructionMode,
   InstructionTemplate,
   Lang,
+  OfficialAuthCandidate,
   OfficialConfigDraft,
   PromptInjectionMode,
   ProviderConnectionResult,
@@ -188,7 +189,7 @@ const dict = {
       local: "本地保存",
       noProviders: "还没有供应商，点击右上角 + 添加。",
       officialEdit: "OpenAI Official 编辑",
-      officialHint: "官方配置与当前中转配置独立保存。还原只恢复 Codex-X 官方快照，不会切换当前供应商；切换回官方时会优先使用该快照。",
+      officialHint: "官方配置与当前中转配置独立保存。读取配置不会切换当前供应商；切换回官方时会优先使用已保存配置。",
       officialUrl: "官方入口",
       formAdd: "添加新供应商",
       formEdit: "编辑供应商",
@@ -289,7 +290,7 @@ const dict = {
       local: "Local",
       noProviders: "No provider yet. Click + to add one.",
       officialEdit: "OpenAI Official settings",
-      officialHint: "Official settings are stored separately from the active proxy. Restore only recovers the Codex-X snapshot without switching providers; switching back uses that snapshot first.",
+      officialHint: "Official settings are stored separately from the active proxy. Loading a config does not switch providers; switching back uses the saved config first.",
       officialUrl: "Official URL",
       formAdd: "Add provider",
       formEdit: "Edit provider",
@@ -374,7 +375,8 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
     officialAuthLabel: "auth.json (JSON)",
     officialTomlLabel: "config.toml (TOML)",
     officialSaveLabel: isChinese ? "保存官方配置" : "Save official config",
-    restoreOfficialLabel: isChinese ? "还原官方配置" : "Restore official config",
+    loadCcSwitchOfficialLabel: isChinese ? "从 CC Switch 载入" : "Load from CC Switch",
+    restoreOfficialLabel: isChinese ? "读取已保存配置" : "Load saved config",
     resetOfficialLabel: isChinese ? "新建官方配置" : "Create official config",
     resetOfficialTitle: isChinese ? "新建官方配置" : "Create official config",
     resetOfficialDescription: isChinese
@@ -1801,8 +1803,35 @@ function App() {
           });
         }
         handleActionResult(result);
+        setToast(lang === "zh" ? "已读取保存的官方配置" : "Saved official config loaded");
       },
     );
+
+  const loadCcSwitchOfficial = async () => {
+    const requestId = ++officialDraftRequestRef.current;
+    const actionToken = beginActionBusy("loadCcSwitchOfficial");
+    setError("");
+    try {
+      const candidate = await invoke<OfficialAuthCandidate | null>("read_ccswitch_official_auth", {
+        dbPath: null,
+      });
+      if (requestId !== officialDraftRequestRef.current) return;
+      if (!candidate) {
+        setToast(lang === "zh" ? "未找到 CC Switch 官方配置" : "No CC Switch official config found");
+        return;
+      }
+      setOfficialForm((current) => ({
+        model: candidate.model || current.model || state?.model || "gpt-5.5",
+        authJson: candidate.authJson,
+        configText: candidate.configText || current.configText,
+      }));
+      setToast(lang === "zh" ? "已从 CC Switch 载入" : "Loaded from CC Switch");
+    } catch (e) {
+      if (requestId === officialDraftRequestRef.current) setError(String(e));
+    } finally {
+      endActionBusy(actionToken);
+    }
+  };
 
   const resetOfficialProvider = () =>
     call(
@@ -2169,7 +2198,13 @@ function App() {
 
   const openAddProvider = () => {
     const liveToml = state?.configText?.trim() || "";
-    const next = { ...blankProviderForm, tomlConfig: liveToml };
+    const next = {
+      ...blankProviderForm,
+      model: state?.model?.trim() || blankProviderForm.model,
+      wireApi: currentProvider?.wireApi?.trim() || blankProviderForm.wireApi,
+      requiresOpenaiAuth: currentProvider?.requiresOpenaiAuth ?? blankProviderForm.requiresOpenaiAuth,
+      tomlConfig: liveToml,
+    };
     resetAvailableProviderModels();
     setEditingProviderId(null);
     setEditingDetectedProvider(false);
@@ -2509,6 +2544,7 @@ function App() {
                 fetchingModels={providerModelsLoading}
                 onImportCcSwitch={importFromCcSwitch}
                 onAddProvider={openAddProvider}
+                onLoadCcSwitchOfficial={() => void loadCcSwitchOfficial()}
                 onEnableProvider={(row) => {
                   if (row.source === "official") {
                     switchOfficialProvider();
