@@ -239,6 +239,7 @@ function ListPage({
 }: Pick<ProvidersPageProps, "copy" | "providerRows" | "loading" | "testingId" | "actionBusy" | "onImportCcSwitch" | "onAddProvider" | "onRestoreOfficial" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDeleteProvider">) {
   const [providerToDelete, setProviderToDelete] = useState<ProviderRow | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const providerActionsBusy = loading || Boolean(actionBusy);
 
   const closeDeleteDialog = () => {
     if (!deleting) setProviderToDelete(null);
@@ -267,12 +268,12 @@ function ListPage({
             type="button"
             className="cx-providers-button cx-providers-button--secondary"
             onClick={onImportCcSwitch}
-            disabled={loading || Boolean(actionBusy)}
+            disabled={providerActionsBusy}
           >
             {actionBusy === "importCcSwitch" ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" /> : <RefreshCw size={15} aria-hidden="true" />}
             {copy.importLabel}
           </button>
-          <button type="button" className="cx-providers-button cx-providers-button--dark" onClick={onAddProvider} disabled={loading}>
+          <button type="button" className="cx-providers-button cx-providers-button--dark" onClick={onAddProvider} disabled={providerActionsBusy}>
             <Plus size={15} aria-hidden="true" />
             {copy.addLabel}
           </button>
@@ -306,7 +307,7 @@ function ListPage({
                   type="button"
                   className="cx-providers-button cx-providers-button--small cx-providers-button--secondary"
                   onClick={() => onEnableProvider(row)}
-                  disabled={loading || row.isCurrent}
+                  disabled={providerActionsBusy || row.isCurrent}
                 >
                   {copy.enableLabel}
                 </button>
@@ -315,7 +316,7 @@ function ListPage({
                     icon={RotateCcw}
                     label={copy.restoreOfficialLabel}
                     onClick={onRestoreOfficial}
-                    disabled={loading}
+                    disabled={providerActionsBusy}
                   />
                 )}
                 {row.testable !== false && (
@@ -323,14 +324,14 @@ function ListPage({
                     icon={isTesting ? Loader2 : Activity}
                     label={copy.testLabel}
                     onClick={() => onTestProvider(row)}
-                    disabled={loading || isTesting}
+                    disabled={providerActionsBusy || isTesting}
                   />
                 )}
                 {row.editable !== false && (
-                  <ActionIconButton icon={PencilLine} label={copy.editLabel} onClick={() => onEditProvider(row)} disabled={loading} />
+                  <ActionIconButton icon={PencilLine} label={copy.editLabel} onClick={() => onEditProvider(row)} disabled={providerActionsBusy} />
                 )}
                 {row.deletable && (
-                  <ActionIconButton icon={Trash2} label={copy.removeLabel} onClick={() => setProviderToDelete(row)} disabled={loading} danger />
+                  <ActionIconButton icon={Trash2} label={copy.removeLabel} onClick={() => setProviderToDelete(row)} disabled={providerActionsBusy} danger />
                 )}
               </div>
             </article>
@@ -374,7 +375,7 @@ function ListPage({
   );
 }
 
-function ModeHeader({ eyebrow, title, description, cancelLabel, onCancel }: { eyebrow: string; title: string; description: string; cancelLabel: string; onCancel: () => void }) {
+function ModeHeader({ eyebrow, title, description, cancelLabel, onCancel, disabled = false }: { eyebrow: string; title: string; description: string; cancelLabel: string; onCancel: () => void; disabled?: boolean }) {
   return (
     <header className="cx-providers-form-header">
       <div>
@@ -382,7 +383,7 @@ function ModeHeader({ eyebrow, title, description, cancelLabel, onCancel }: { ey
         <h2>{title}</h2>
         <p>{description}</p>
       </div>
-      <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onCancel}>
+      <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onCancel} disabled={disabled}>
         <ArrowLeft size={15} aria-hidden="true" />
         {cancelLabel}
       </button>
@@ -396,14 +397,16 @@ function OfficialForm({
   officialAuthRef,
   officialInfo,
   loading,
+  actionBusy,
   onCancelMode,
   onOfficialModelChange,
   onOfficialAuthChange,
   onSaveOfficial,
   onRestoreOfficial,
   onResetOfficial,
-}: Pick<ProvidersPageProps, "copy" | "officialForm" | "officialAuthRef" | "officialInfo" | "loading" | "onCancelMode" | "onOfficialModelChange" | "onOfficialAuthChange" | "onSaveOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
+}: Pick<ProvidersPageProps, "copy" | "officialForm" | "officialAuthRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialModelChange" | "onOfficialAuthChange" | "onSaveOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const formBusy = loading || actionBusy === "loadOfficialDraft";
 
   const confirmReset = () => {
     setResetConfirmOpen(false);
@@ -412,14 +415,14 @@ function OfficialForm({
 
   return (
     <>
-      <ModeHeader eyebrow={copy.officialEyebrow} title={copy.officialTitle} description={copy.officialHint} cancelLabel={copy.cancelLabel} onCancel={onCancelMode} />
+      <ModeHeader eyebrow={copy.officialEyebrow} title={copy.officialTitle} description={copy.officialHint} cancelLabel={copy.cancelLabel} onCancel={onCancelMode} disabled={formBusy} />
       <div className="cx-providers-info-grid">
         <div><span>{copy.officialUrlLabel}</span><code>{officialInfo.officialUrl}</code></div>
         <div><span>{copy.authPathLabel}</span><code>{officialInfo.authPath}</code></div>
         <div><span>{copy.officialCurrentLabel}</span><code>{officialInfo.current}</code></div>
       </div>
       <div className="cx-providers-form-grid cx-providers-form-grid--single">
-        <Field label={copy.modelLabel}><input value={officialForm.model} onChange={(event) => onOfficialModelChange(event.target.value)} /></Field>
+        <Field label={copy.modelLabel}><input value={officialForm.model} onChange={(event) => onOfficialModelChange(event.target.value)} disabled={formBusy} /></Field>
       </div>
       <Field label={copy.officialAuthLabel} className="cx-providers-editor-field">
         <textarea
@@ -427,18 +430,19 @@ function OfficialForm({
           className="cx-providers-code-editor cx-providers-auth-editor"
           value={officialForm.authJson}
           onChange={(event) => onOfficialAuthChange(event.target.value)}
+          disabled={formBusy}
           wrap="soft"
           spellCheck={false}
         />
       </Field>
       <div className="cx-providers-form-actions cx-providers-form-actions--save cx-providers-official-actions">
-        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onRestoreOfficial} disabled={loading}>
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onRestoreOfficial} disabled={formBusy}>
           <RotateCcw size={15} aria-hidden="true" />{copy.restoreOfficialLabel}
         </button>
-        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={loading}>
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={formBusy}>
           <FilePlus2 size={15} aria-hidden="true" />{copy.resetOfficialLabel}
         </button>
-        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveOfficial} disabled={loading}><CheckCircle2 size={15} aria-hidden="true" />{copy.officialSaveLabel}</button>
+        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveOfficial} disabled={formBusy}><CheckCircle2 size={15} aria-hidden="true" />{copy.officialSaveLabel}</button>
       </div>
       <ModalShell
         open={resetConfirmOpen}
@@ -489,6 +493,7 @@ function ProviderForm({
 }: Pick<ProvidersPageProps, "copy" | "providerForm" | "loading" | "editingProviderId" | "providerAuthPreview" | "providerTomlDraft" | "providerTomlRef" | "apiKeyVisible" | "availableModels" | "fetchingModels" | "onCancelMode" | "onApiKeyChange" | "onBaseUrlChange" | "onProviderNameChange" | "onProviderModelChange" | "onFetchModels" | "onWireApiChange" | "onRequiresAuthChange" | "onToggleApiKeyVisibility" | "onProviderTomlDraftChange" | "onResetProviderToml" | "onSaveProvider">) {
   const modelListId = useId();
   const canFetchModels = Boolean(providerForm.baseUrl.trim() && providerForm.apiKey.trim());
+  const formBusy = loading || fetchingModels;
 
   return (
     <>
@@ -498,6 +503,7 @@ function ProviderForm({
         description={copy.formHint}
         cancelLabel={copy.cancelLabel}
         onCancel={onCancelMode}
+        disabled={formBusy}
       />
 
       <section className="cx-providers-form-section">
@@ -512,14 +518,15 @@ function ProviderForm({
                 value={providerForm.apiKey}
                 onChange={(event) => onApiKeyChange(event.target.value)}
                 placeholder={copy.apiKeyPlaceholder}
+                disabled={formBusy}
               />
-              <button type="button" onClick={onToggleApiKeyVisibility} title={apiKeyVisible ? copy.hideApiKeyLabel : copy.showApiKeyLabel} aria-label={apiKeyVisible ? copy.hideApiKeyLabel : copy.showApiKeyLabel}>
+              <button type="button" onClick={onToggleApiKeyVisibility} title={apiKeyVisible ? copy.hideApiKeyLabel : copy.showApiKeyLabel} aria-label={apiKeyVisible ? copy.hideApiKeyLabel : copy.showApiKeyLabel} disabled={formBusy}>
                 {apiKeyVisible ? <EyeOff size={15} aria-hidden="true" /> : <Eye size={15} aria-hidden="true" />}
               </button>
             </div>
           </Field>
-          <Field label={copy.baseUrlLabel} className="cx-providers-field--full"><input value={providerForm.baseUrl} onChange={(event) => onBaseUrlChange(event.target.value)} /></Field>
-          <Field label={copy.nameLabel}><input value={providerForm.providerName} onChange={(event) => onProviderNameChange(event.target.value)} /></Field>
+          <Field label={copy.baseUrlLabel} className="cx-providers-field--full"><input value={providerForm.baseUrl} onChange={(event) => onBaseUrlChange(event.target.value)} disabled={formBusy} /></Field>
+          <Field label={copy.nameLabel}><input value={providerForm.providerName} onChange={(event) => onProviderNameChange(event.target.value)} disabled={formBusy} /></Field>
           <Field label={copy.modelLabel}>
             <div className="cx-providers-model-input-row">
               <input
@@ -527,6 +534,7 @@ function ProviderForm({
                 list={availableModels.length ? modelListId : undefined}
                 aria-label={copy.modelLabel}
                 onChange={(event) => onProviderModelChange(event.target.value)}
+                disabled={formBusy}
               />
               <button
                 type="button"
@@ -551,6 +559,7 @@ function ProviderForm({
                   className="cx-providers-model-select"
                   value=""
                   aria-label={copy.chooseModelLabel(availableModels.length)}
+                  disabled={formBusy}
                   onChange={(event) => {
                     if (event.target.value) onProviderModelChange(event.target.value);
                   }}
@@ -562,7 +571,7 @@ function ProviderForm({
             )}
           </Field>
           <Field label={copy.wireApiLabel}>
-            <select value={providerForm.wireApi} onChange={(event) => onWireApiChange(event.target.value)}>
+            <select value={providerForm.wireApi} onChange={(event) => onWireApiChange(event.target.value)} disabled={formBusy}>
               <option value="responses">responses</option>
               <option value="chat">chat</option>
             </select>
@@ -572,6 +581,7 @@ function ProviderForm({
             checked={providerForm.requiresOpenaiAuth}
             onCheckedChange={onRequiresAuthChange}
             label={copy.requiresAuthLabel}
+            disabled={formBusy}
           />
         </div>
       </section>
@@ -584,13 +594,13 @@ function ProviderForm({
       <section className="cx-providers-form-section">
         <div className="cx-providers-section-heading cx-providers-section-heading--with-action">
           <div><h3>{copy.tomlTitle}</h3><p>{copy.tomlDescription}</p></div>
-          <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" onClick={onResetProviderToml}><RefreshCw size={14} aria-hidden="true" />{copy.resetTomlLabel}</button>
+          <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" onClick={onResetProviderToml} disabled={formBusy}><RefreshCw size={14} aria-hidden="true" />{copy.resetTomlLabel}</button>
         </div>
-        <textarea ref={providerTomlRef} className="cx-providers-code-editor cx-providers-toml-editor" value={providerTomlDraft} onChange={(event) => onProviderTomlDraftChange(event.target.value)} spellCheck={false} />
+        <textarea ref={providerTomlRef} className="cx-providers-code-editor cx-providers-toml-editor" value={providerTomlDraft} onChange={(event) => onProviderTomlDraftChange(event.target.value)} disabled={formBusy} spellCheck={false} />
       </section>
 
       <div className="cx-providers-form-actions cx-providers-form-actions--save">
-        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveProvider} disabled={loading}>
+        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveProvider} disabled={formBusy}>
           {loading ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" /> : <CheckCircle2 size={15} aria-hidden="true" />}
           {loading ? copy.savingLabel : copy.saveLabel}
         </button>

@@ -2,9 +2,9 @@ use crate::backups::create_backup;
 use crate::config_path;
 use crate::error::Result;
 use crate::file_io::parse_toml_document;
-use crate::live_config::{
-    acquire_live_config_lock, atomic_write_if_unchanged, read_file_snapshot, text_from_snapshot,
-};
+#[cfg(test)]
+use crate::live_config::acquire_live_config_lock;
+use crate::live_config::{atomic_write_if_unchanged, read_file_snapshot, text_from_snapshot};
 use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table};
 
@@ -31,6 +31,7 @@ fn remove_markdown_path(table: &mut Table, key: &str) -> Option<Item> {
 
 /// Repairs prompt paths appended by older Codex-X versions after a `[tui]`
 /// header. Only the exact legacy keys with Markdown path values are touched.
+#[cfg(test)]
 pub(crate) fn migrate_legacy_prompt_config(codex_dir: &Path) -> Result<bool> {
     let _lock = acquire_live_config_lock(codex_dir)?;
     migrate_legacy_prompt_config_locked(codex_dir)

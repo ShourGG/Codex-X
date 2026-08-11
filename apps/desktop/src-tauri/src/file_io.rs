@@ -108,6 +108,7 @@ pub(crate) fn read_to_string_if_exists(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|e| io_err(path, e))
 }
 
+#[cfg(test)]
 pub(crate) fn harden_sensitive_file_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

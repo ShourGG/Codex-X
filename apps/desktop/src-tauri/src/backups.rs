@@ -216,7 +216,3 @@ pub(crate) fn backups() -> Result<Vec<BackupEntry>> {
     entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(entries)
 }
-
-pub(crate) fn latest_backup() -> Result<Option<BackupEntry>> {
-    Ok(backups()?.into_iter().next())
-}

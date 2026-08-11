@@ -2,6 +2,7 @@ import React from "react";
 import { flushSync } from "react-dom";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { Loader2 } from "lucide-react";
 import {
   SessionManagementPage,
   type SessionPreview,
@@ -538,8 +539,20 @@ function extractTomlProviderApiKey(configText: string | undefined, providerId?: 
   return topLevelValue || (!providerId ? firstProviderValue : "");
 }
 
+function extractTomlModelProvider(configText: string | undefined) {
+  if (!configText?.trim()) return "";
+  for (const line of configText.replace(/\r\n?/g, "\n").split("\n")) {
+    if (/^\s*\[/.test(line)) break;
+    const entry = line.match(/^\s*model_provider\s*=\s*(.+?)\s*$/);
+    if (entry) return parseTomlStringValue(entry[1]).trim();
+  }
+  return "";
+}
+
 function savedProviderApiKey(provider: SavedProvider) {
-  return (provider.apiKey || "").trim() || extractTomlProviderApiKey(provider.tomlConfig);
+  const providerId = extractTomlModelProvider(provider.tomlConfig);
+  return (provider.apiKey || "").trim()
+    || extractTomlProviderApiKey(provider.tomlConfig, providerId || undefined);
 }
 
 function providerIdentityKey(baseUrl?: string | null, apiKey?: string | null, providerName?: string | null) {
@@ -692,6 +705,23 @@ function fitCodeEditorHeight(editor: HTMLTextAreaElement | null, minHeight: numb
   editor.style.height = `${Math.max(minHeight, editor.scrollHeight + 2)}px`;
 }
 
+function normalizedConfigDirForComparison(value: string) {
+  let normalized = value.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (/^(?:[a-z]:\/|\/\/)/i.test(normalized)) normalized = normalized.toLowerCase();
+  return normalized;
+}
+
+function CodexStateLoading({ lang, loading }: { lang: Lang; loading: boolean }) {
+  return (
+    <section className="cx-state-loading" role="status" aria-live="polite">
+      {loading && <Loader2 className="spin" size={22} aria-hidden="true" />}
+      <span>{loading
+        ? (lang === "zh" ? "正在读取 Codex 配置..." : "Loading Codex configuration...")
+        : (lang === "zh" ? "Codex 配置读取失败，请返回概览重试" : "Could not load the Codex configuration. Retry from Overview.")}</span>
+    </section>
+  );
+}
+
 function App() {
   const initialLang = (localStorage.getItem(LANG_KEY) as Lang | null) || "zh";
   const [lang, setLang] = React.useState<Lang>(initialLang === "en" ? "en" : "zh");
@@ -718,6 +748,7 @@ function App() {
   const [savedPrompts, setSavedPrompts] = React.useState<SavedPrompt[]>([]);
   const [builtinPromptStatus, setBuiltinPromptStatus] = React.useState<BuiltinPromptStatus[]>([]);
   const [aboutInfo, setAboutInfo] = React.useState<AboutInfo | null>(null);
+  const [aboutLoading, setAboutLoading] = React.useState(false);
   const [releaseInfo, setReleaseInfo] = React.useState<ReleaseInfo>({ status: "idle" });
   const [updatePromptOpen, setUpdatePromptOpen] = React.useState(false);
   const [sessionStatus, setSessionStatus] = React.useState<SessionSyncStatus | null>(null);
@@ -737,12 +768,15 @@ function App() {
   const [sessionDeleteSafetyConfirmed, setSessionDeleteSafetyConfirmed] = React.useState(false);
   const [state, setState] = React.useState<CodexState | null>(null);
   const [configDir, setConfigDir] = React.useState("");
+  const [configDirDraft, setConfigDirDraft] = React.useState("");
   const [loading, setLoading] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(true);
   const [toast, setToast] = React.useState<string>("");
   const [error, setError] = React.useState<string>("");
   const [providerForm, setProviderForm] = React.useState<SavedProvider>(defaultProviderForm);
   const [providerTomlDraft, setProviderTomlDraft] = React.useState("");
   const [providerTomlDirty, setProviderTomlDirty] = React.useState(false);
+  const [providerDraftRefreshToken, setProviderDraftRefreshToken] = React.useState(0);
   const [providerApiKeyVisible, setProviderApiKeyVisible] = React.useState(false);
   const [providerTestingId, setProviderTestingId] = React.useState("");
   const [availableProviderModels, setAvailableProviderModels] = React.useState<ProviderModel[]>([]);
@@ -759,14 +793,26 @@ function App() {
   const officialAuthEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const providerTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const providerModelsRequestRef = React.useRef(0);
+  const providerDraftRequestRef = React.useRef(0);
+  const officialDraftRequestRef = React.useRef(0);
+  const loadingGenerationRef = React.useRef(0);
+  const loadingTokensRef = React.useRef(new Set<number>());
+  const actionBusyGenerationRef = React.useRef(0);
+  const actionBusyTokensRef = React.useRef(new Map<number, string>());
   const promptModeHelpRef = React.useRef<HTMLDivElement | null>(null);
   const promptRefreshRequestRef = React.useRef(0);
   const refreshRequestRef = React.useRef(0);
+  const aboutLoadKeyRef = React.useRef("");
+  const sessionAutoLoadKeyRef = React.useRef("");
+  const sessionLoadRequestRef = React.useRef(0);
   const promptRefreshInFlightRef = React.useRef<Promise<BuiltinPromptStatus[]> | null>(null);
   const promptAutoRefreshAttemptedRef = React.useRef(false);
   const promptCatalogReadyRef = React.useRef(false);
   const promptModeSyncedRef = React.useRef("");
-  const skillsMcpLoadedRef = React.useRef(false);
+  const skillsMcpLoadedRef = React.useRef("");
+  const skillsMcpAutoLoadAttemptedRef = React.useRef("");
+  const skillsMcpRequestRef = React.useRef(0);
+  const activeConfigDirKeyRef = React.useRef("");
   const themeTransitionTimerRef = React.useRef<number | null>(null);
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm), [providerForm]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
@@ -783,6 +829,52 @@ function App() {
     && !instructionTemplates.some((item) => item.id === activeBuiltinTemplateId)
     ? activeBuiltinTemplateId
     : "";
+
+  const syncActionBusy = React.useCallback(() => {
+    let latestToken = -1;
+    let latestAction = "";
+    for (const [token, action] of actionBusyTokensRef.current) {
+      if (token > latestToken) {
+        latestToken = token;
+        latestAction = action;
+      }
+    }
+    setActionBusy(latestAction);
+  }, []);
+
+  const beginLoading = React.useCallback(() => {
+    const token = ++loadingGenerationRef.current;
+    loadingTokensRef.current.add(token);
+    setLoading(true);
+    return token;
+  }, []);
+
+  const endLoading = React.useCallback((token: number) => {
+    if (!loadingTokensRef.current.delete(token)) return;
+    setLoading(loadingTokensRef.current.size > 0);
+  }, []);
+
+  const beginActionBusy = React.useCallback((action: string) => {
+    const token = ++actionBusyGenerationRef.current;
+    actionBusyTokensRef.current.set(token, action);
+    setActionBusy(action);
+    return token;
+  }, []);
+
+  const endActionBusy = React.useCallback((token: number) => {
+    if (!actionBusyTokensRef.current.delete(token)) return;
+    syncActionBusy();
+  }, [syncActionBusy]);
+
+  const clearActionBusy = React.useCallback((action: string) => {
+    let changed = false;
+    for (const [token, activeAction] of actionBusyTokensRef.current) {
+      if (activeAction !== action) continue;
+      actionBusyTokensRef.current.delete(token);
+      changed = true;
+    }
+    if (changed) syncActionBusy();
+  }, [syncActionBusy]);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile, instructionTemplates);
   const releaseStatusLabel = React.useMemo(() => {
     if (updater.state.phase === "downloading") return lang === "zh" ? "下载中" : "Downloading";
@@ -853,6 +945,10 @@ function App() {
   }, [promptInjectionMode]);
 
   React.useEffect(() => {
+    activeConfigDirKeyRef.current = normalizedConfigDirForComparison(configDir);
+  }, [configDir]);
+
+  React.useEffect(() => {
     if (error) setToast("");
   }, [error]);
 
@@ -880,9 +976,49 @@ function App() {
   }, [providerMode, providerTomlDraft]);
 
   React.useEffect(() => {
-    if (providerMode !== "form" || providerTomlDirty) return;
-    setProviderTomlDraft(providerTomlPreview);
-  }, [providerMode, providerTomlDirty, providerTomlPreview]);
+    if (providerMode !== "form") {
+      providerDraftRequestRef.current += 1;
+      return;
+    }
+    const requestId = ++providerDraftRequestRef.current;
+    if (providerTomlDirty) return;
+
+    const fallback = providerForm.tomlConfig?.trim()
+      || state?.configText?.trim()
+      || providerTomlPreview;
+    if (!providerForm.providerName.trim() || !providerForm.baseUrl.trim() || !providerForm.model.trim()) {
+      setProviderTomlDraft(fallback);
+      return;
+    }
+
+    void invoke<string>("build_provider_toml_draft", {
+      provider: {
+        ...providerForm,
+        id: providerForm.id || customProviderId(providerForm.providerName || providerForm.baseUrl),
+      },
+      configDir: configDir || null,
+    })
+      .then((draft) => {
+        if (requestId === providerDraftRequestRef.current) setProviderTomlDraft(draft);
+      })
+      .catch(() => {
+        if (requestId === providerDraftRequestRef.current) setProviderTomlDraft(fallback);
+      });
+  }, [configDir, providerDraftRefreshToken, providerForm, providerMode, providerTomlDirty, providerTomlPreview, state?.configText]);
+
+  React.useEffect(() => {
+    if (tab === "provider" && providerMode === "form") return;
+    providerModelsRequestRef.current += 1;
+    setAvailableProviderModels([]);
+    setProviderModelsLoading(false);
+    if (providerModelsLoading) setToast("");
+  }, [providerMode, providerModelsLoading, tab]);
+
+  React.useEffect(() => {
+    if (tab === "provider" && providerMode === "official") return;
+    officialDraftRequestRef.current += 1;
+    clearActionBusy("loadOfficialDraft");
+  }, [clearActionBusy, providerMode, tab]);
 
   React.useEffect(() => {
     if (providerMode !== "official") return;
@@ -1114,7 +1250,7 @@ function App() {
   }, [selectedSessions.length, sessionDeleteConfirmOpen]);
 
   const call = React.useCallback(async <T,>(fn: () => Promise<T>, success?: (data: T) => void) => {
-    setLoading(true);
+    const loadingToken = beginLoading();
     setError("");
     try {
       const data = await fn();
@@ -1122,54 +1258,109 @@ function App() {
     } catch (e) {
       setError(String(e));
     } finally {
-      setLoading(false);
+      endLoading(loadingToken);
     }
-  }, []);
+  }, [beginLoading, endLoading]);
 
-  const refresh = React.useCallback(() => {
+  const refresh = React.useCallback((includeDiagnostics: boolean) => {
     const requestId = ++refreshRequestRef.current;
+    officialDraftRequestRef.current += 1;
+    clearActionBusy("loadOfficialDraft");
+    skillsMcpRequestRef.current += 1;
+    skillsMcpLoadedRef.current = "";
+    skillsMcpAutoLoadAttemptedRef.current = "";
+    const requestedConfigDir = configDirDraft.trim();
+    const resolvedConfigDir = requestedConfigDir || null;
+    const activeCodexDir = state?.codexDir || configDir;
+    setRefreshing(true);
+    setError("");
+    setState(null);
     setSessionStatus(null);
-    call(
-      async () => {
-        const [next, providerList, promptList, promptStatus, about] = await Promise.all([
-          invoke<CodexState>("get_codex_state", { configDir: configDir || null }),
+    setSkillsMcpState(null);
+    setSkillsMcpImportOpen(false);
+    setSkillsMcpImportPreview(null);
+    setAboutInfo(null);
+    aboutLoadKeyRef.current = "";
+    sessionAutoLoadKeyRef.current = "";
+    sessionLoadRequestRef.current += 1;
+
+    if (includeDiagnostics) {
+      void invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: resolvedConfigDir })
+        .then((diagnostics) => {
+          if (requestId === refreshRequestRef.current) setStartupDiagnostics(diagnostics);
+        })
+        .catch(() => {
+          if (requestId === refreshRequestRef.current) setStartupDiagnostics(null);
+        });
+    }
+
+    void invoke<CodexState>("get_codex_state", { configDir: resolvedConfigDir })
+      .then((next) => {
+        if (requestId !== refreshRequestRef.current) return;
+        if (normalizedConfigDirForComparison(next.codexDir)
+          !== normalizedConfigDirForComparison(activeCodexDir)) {
+          providerDraftRequestRef.current += 1;
+          providerModelsRequestRef.current += 1;
+          setProviderMode("list");
+          setEditingProviderId(null);
+          setEditingDetectedProvider(false);
+          setProviderTomlDirty(false);
+          setProviderTomlDraft("");
+          setAvailableProviderModels([]);
+          setProviderModelsLoading(false);
+        }
+        activeConfigDirKeyRef.current = normalizedConfigDirForComparison(next.codexDir);
+        setConfigDir(next.codexDir);
+        setConfigDirDraft(next.codexDir);
+        setState(next);
+        setRefreshing(false);
+
+        void Promise.allSettled([
           invoke<SavedProvider[]>("list_saved_providers"),
           invoke<SavedPrompt[]>("list_saved_prompts"),
           invoke<BuiltinPromptStatus[]>("get_builtin_prompt_status"),
-          invoke<AboutInfo>("get_about_info", { configDir: configDir || null }),
-        ]);
-        return { next, providerList, promptList, promptStatus, about };
-      },
-      ({ next, providerList, promptList, promptStatus, about }) => {
+        ]).then(([providers, prompts, promptStatus]) => {
+          if (requestId !== refreshRequestRef.current) return;
+          if (providers.status === "fulfilled") setSavedProviders(providers.value);
+          if (prompts.status === "fulfilled") setSavedPrompts(prompts.value);
+          if (promptStatus.status === "fulfilled") {
+            setBuiltinPromptStatus(uniqueBuiltinPromptStatuses(promptStatus.value));
+          }
+        });
+      })
+      .catch((nextError) => {
         if (requestId !== refreshRequestRef.current) return;
-        setState(next);
-        setSavedProviders(providerList);
-        setSavedPrompts(promptList);
-        setBuiltinPromptStatus(uniqueBuiltinPromptStatuses(promptStatus));
-        setAboutInfo(about);
-        const resolvedConfigDir = configDir || null;
-        void invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: resolvedConfigDir })
-          .then((diagnostics) => {
-            if (requestId === refreshRequestRef.current) setStartupDiagnostics(diagnostics);
-          })
-          .catch(() => {
-            if (requestId === refreshRequestRef.current) setStartupDiagnostics(null);
-          });
-        void invoke<SessionSyncStatus>("get_session_sync_status", { configDir: resolvedConfigDir, targetProvider: null })
-          .then((sessions) => {
-            if (requestId === refreshRequestRef.current) setSessionStatus(sessions);
-          })
-          .catch(() => {
-            if (requestId === refreshRequestRef.current) setSessionStatus(null);
-          });
-      },
-    );
-  }, [call, configDir]);
+        setRefreshing(false);
+        setError(String(nextError));
+      });
+  }, [clearActionBusy, configDir, configDirDraft, state?.codexDir]);
 
   React.useEffect(() => {
-    refresh();
+    refresh(startupWizardOpen);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  React.useEffect(() => {
+    if (!state?.codexDir) return;
+    const loadKey = state.codexDir;
+    if (aboutLoadKeyRef.current === loadKey) return;
+    aboutLoadKeyRef.current = loadKey;
+    setAboutLoading(true);
+    void invoke<AboutInfo>("get_about_info", { configDir: loadKey })
+      .then((about) => {
+        if (aboutLoadKeyRef.current === loadKey) setAboutInfo(about);
+      })
+      .catch((aboutError) => {
+        if (aboutLoadKeyRef.current !== loadKey) return;
+        aboutLoadKeyRef.current = "";
+        setError(String(aboutError));
+      })
+      .finally(() => {
+        if (aboutLoadKeyRef.current === loadKey || aboutLoadKeyRef.current === "") {
+          setAboutLoading(false);
+        }
+      });
+  }, [state?.codexDir, tab]);
 
   React.useEffect(() => {
     if (!state) return;
@@ -1198,17 +1389,16 @@ function App() {
   const handleActionResult = (result: ActionResult) => {
     setState(result.state);
     setSessionStatus(null);
+    sessionAutoLoadKeyRef.current = "";
+    sessionLoadRequestRef.current += 1;
     setToast(result.message);
-    const resolvedConfigDir = configDir || null;
-    void Promise.all([
+    void Promise.allSettled([
       invoke<SavedPrompt[]>("list_saved_prompts"),
       invoke<SavedProvider[]>("list_saved_providers"),
-      invoke<SessionSyncStatus>("get_session_sync_status", { configDir: resolvedConfigDir, targetProvider: null }),
     ])
-      .then(([promptList, providerList, sessions]) => {
-        setSavedPrompts(promptList);
-        setSavedProviders(providerList);
-        setSessionStatus(sessions);
+      .then(([prompts, providers]) => {
+        if (prompts.status === "fulfilled") setSavedPrompts(prompts.value);
+        if (providers.status === "fulfilled") setSavedProviders(providers.value);
       })
       .catch(() => undefined);
   };
@@ -1333,8 +1523,8 @@ function App() {
       setError(lang === "zh" ? "请选择 .md 提示词文件" : "Please choose a .md prompt file");
       return;
     }
-    setActionBusy("importPrompt");
-    setLoading(true);
+    const actionToken = beginActionBusy("importPrompt");
+    const loadingToken = beginLoading();
     setError("");
     try {
       const content = await file.text();
@@ -1354,8 +1544,8 @@ function App() {
     } catch (e) {
       setError(String(e));
     } finally {
-      setLoading(false);
-      setActionBusy("");
+      endLoading(loadingToken);
+      endActionBusy(actionToken);
       if (promptImportRef.current) promptImportRef.current.value = "";
     }
   };
@@ -1410,14 +1600,14 @@ function App() {
     }
   };
 
-  const normalizedProviderForm = (): SavedProvider => ({
+  const normalizedProviderForm = (tomlConfig = providerTomlDraft || providerForm.tomlConfig || buildProviderTomlPreview(providerForm)): SavedProvider => ({
     ...providerForm,
     id: editingProviderId || uniqueId(providerForm.id || customProviderId(providerForm.providerName || providerForm.baseUrl), savedProviders.map((item) => item.id)),
     providerName: providerForm.providerName.trim(),
     baseUrl: providerForm.baseUrl.trim().replace(/\/+$/, ""),
     model: providerForm.model.trim(),
     apiKey: (providerForm.apiKey || "").trim(),
-    tomlConfig: (providerTomlDraft || providerForm.tomlConfig || buildProviderTomlPreview(providerForm)).trimEnd(),
+    tomlConfig: tomlConfig.trimEnd(),
     wireApi: providerForm.wireApi || "responses",
     requiresOpenaiAuth: providerForm.requiresOpenaiAuth,
   });
@@ -1448,8 +1638,8 @@ function App() {
   };
 
   const saveProviderOnly = () => {
-    const provider = normalizedProviderForm();
-    if (!provider.providerName || !provider.baseUrl || !provider.model) {
+    const pendingProvider = normalizedProviderForm();
+    if (!pendingProvider.providerName || !pendingProvider.baseUrl || !pendingProvider.model) {
       setError(lang === "zh"
         ? "请填写供应商名称、API 请求地址和模型"
         : "Provider name, API URL, and model are required");
@@ -1457,6 +1647,17 @@ function App() {
     }
     return call(
       async () => {
+        let provider = pendingProvider;
+        if (!providerTomlDirty) {
+          const draftSource = providerForm.tomlConfig?.trim() || state?.configText?.trim() || "";
+          const providerForDraft = normalizedProviderForm(draftSource);
+          const latestDraft = await invoke<string>("build_provider_toml_draft", {
+            provider: providerForDraft,
+            configDir: configDir || null,
+          });
+          provider = { ...providerForDraft, tomlConfig: latestDraft.trimEnd() };
+          setProviderTomlDraft(provider.tomlConfig || "");
+        }
         const applyAfterSave = editingDetectedProvider
           || Boolean(editingProviderId && editingProviderId === effectiveActiveProviderId);
         const applied = applyAfterSave
@@ -1527,6 +1728,7 @@ function App() {
   };
 
   const testProvider = async (id: string, baseUrl: string, apiKey?: string | null) => {
+    const actionToken = beginActionBusy("testProvider");
     setProviderTestingId(id);
     setError("");
     setToast(lang === "zh" ? "正在检测连接..." : "Testing connection...");
@@ -1543,6 +1745,7 @@ function App() {
       setError(String(e));
     } finally {
       setProviderTestingId("");
+      endActionBusy(actionToken);
     }
   };
 
@@ -1599,22 +1802,24 @@ function App() {
     );
 
   const importFromCcSwitch = async () => {
-    setActionBusy("importCcSwitch");
+    const actionToken = beginActionBusy("importCcSwitch");
+    const loadingToken = beginLoading();
     setError("");
     try {
       const result = await invoke<ImportResult>("import_ccswitch_codex_providers", { dbPath: null });
-      setSavedProviders(result.providers);
       const warningText = result.skipped > 0
         ? (lang === "zh" ? `，跳过 ${result.skipped}` : `, ${result.skipped} skipped`)
         : "";
       const successText = lang === "zh"
         ? `cc-switch 导入完成：新增 ${result.added}，更新 ${result.updated}，合并 ${result.merged}${warningText}；未切换当前供应商`
         : `cc-switch import complete: ${result.added} added, ${result.updated} updated, ${result.merged} merged${warningText}; current provider unchanged`;
-      setToast(successText);
       try {
         const nextState = await invoke<CodexState>("get_codex_state", { configDir: configDir || null });
+        setSavedProviders(result.providers);
         setState(nextState);
+        setToast(successText);
       } catch (refreshError) {
+        setSavedProviders(result.providers);
         setToast(lang === "zh"
           ? `${successText}；状态刷新失败，请手动刷新：${String(refreshError)}`
           : `${successText}; state refresh failed, refresh manually: ${String(refreshError)}`);
@@ -1622,7 +1827,8 @@ function App() {
     } catch (importError) {
       setError(String(importError));
     } finally {
-      setActionBusy("");
+      endLoading(loadingToken);
+      endActionBusy(actionToken);
     }
   };
 
@@ -1703,44 +1909,69 @@ function App() {
   }, [aboutInfo?.appVersion, aboutInfo?.nativeUpdaterSupported, lang]);
 
   React.useEffect(() => {
-    if (!state || autoUpdateCheckedRef.current) return;
+    if (!state || !aboutInfo || autoUpdateCheckedRef.current) return;
     autoUpdateCheckedRef.current = true;
     void checkForUpdates({ quiet: true });
-  }, [state, checkForUpdates]);
+  }, [aboutInfo, state, checkForUpdates]);
 
   React.useEffect(() => {
-    if (!state || promptAutoRefreshAttemptedRef.current) return;
+    if (!state || tab !== "instruction" || promptAutoRefreshAttemptedRef.current) return;
     promptAutoRefreshAttemptedRef.current = true;
     void refreshBuiltinPrompts({ quiet: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state]);
+  }, [state, tab]);
+
+  const beginSkillsMcpRequest = React.useCallback(() => ({
+    requestId: ++skillsMcpRequestRef.current,
+    configDir: configDir || null,
+    configDirKey: normalizedConfigDirForComparison(configDir),
+  }), [configDir]);
+
+  const isCurrentSkillsMcpRequest = React.useCallback((requestId: number, configDirKey: string) => (
+    requestId === skillsMcpRequestRef.current
+      && configDirKey === activeConfigDirKeyRef.current
+  ), []);
 
   const loadSkillsMcp = React.useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
-    if (!quiet) {
-      setActionBusy("loadSkillsMcp");
-      setError("");
-    }
+    const request = beginSkillsMcpRequest();
+    const actionToken = quiet ? null : beginActionBusy("loadSkillsMcp");
+    if (!quiet) setError("");
     try {
-      const result = await invoke<SkillsMcpState>("get_skills_mcp_state", { configDir: configDir || null });
+      const result = await invoke<SkillsMcpState>("get_skills_mcp_state", { configDir: request.configDir });
+      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
+      skillsMcpLoadedRef.current = request.configDirKey;
       setSkillsMcpState(result);
     } catch (e) {
-      if (!quiet) setError(String(e));
+      if (!quiet && isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) {
+        setError(String(e));
+      }
     } finally {
-      if (!quiet) setActionBusy("");
+      if (actionToken !== null) endActionBusy(actionToken);
     }
-  }, [configDir]);
+  }, [beginActionBusy, beginSkillsMcpRequest, endActionBusy, isCurrentSkillsMcpRequest]);
 
   React.useEffect(() => {
-    if (tab !== "skillsMcp" || skillsMcpLoadedRef.current) return;
-    skillsMcpLoadedRef.current = true;
+    const configDirKey = normalizedConfigDirForComparison(configDir);
+    if (tab !== "skillsMcp") {
+      skillsMcpAutoLoadAttemptedRef.current = "";
+      return;
+    }
+    if (!state?.codexDir
+      || !configDirKey
+      || Boolean(actionBusy)
+      || skillsMcpAutoLoadAttemptedRef.current === configDirKey
+      || skillsMcpLoadedRef.current === configDirKey) return;
+    skillsMcpAutoLoadAttemptedRef.current = configDirKey;
     void loadSkillsMcp();
-  }, [tab, loadSkillsMcp]);
+  }, [actionBusy, configDir, loadSkillsMcp, state?.codexDir, tab]);
 
   const openImportExistingSkillsMcpPreview = async () => {
-    setActionBusy("previewExistingSkillsMcp");
+    const request = beginSkillsMcpRequest();
+    const actionToken = beginActionBusy("previewExistingSkillsMcp");
     setError("");
     try {
-      const preview = await invoke<SkillsMcpImportPreview>("preview_existing_skills_mcp", { configDir: configDir || null });
+      const preview = await invoke<SkillsMcpImportPreview>("preview_existing_skills_mcp", { configDir: request.configDir });
+      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
       if (preview.skills.length + preview.mcpServers.length === 0) {
         setSkillsMcpImportPreview(null);
         setSkillsMcpImportOpen(false);
@@ -1750,67 +1981,79 @@ function App() {
       setSkillsMcpImportPreview(preview);
       setSkillsMcpImportOpen(true);
     } catch (e) {
-      setError(String(e));
+      if (isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) setError(String(e));
     } finally {
-      setActionBusy("");
+      endActionBusy(actionToken);
     }
   };
 
   const importExistingSkillsMcp = async () => {
-    setActionBusy("importExistingSkillsMcp");
+    const request = beginSkillsMcpRequest();
+    const actionToken = beginActionBusy("importExistingSkillsMcp");
     setError("");
     try {
-      const result = await invoke<SkillsMcpActionResult>("import_existing_skills_mcp", { configDir: configDir || null });
+      const result = await invoke<SkillsMcpActionResult>("import_existing_skills_mcp", { configDir: request.configDir });
+      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
+      skillsMcpLoadedRef.current = request.configDirKey;
       setSkillsMcpState(result.state);
       setSkillsMcpImportOpen(false);
       setSkillsMcpImportPreview(null);
       setToast(result.message);
     } catch (e) {
-      setError(String(e));
+      if (isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) setError(String(e));
     } finally {
-      setActionBusy("");
+      endActionBusy(actionToken);
     }
   };
 
   const checkSkillUpdatesAction = async () => {
-    setActionBusy("checkSkillUpdates");
+    const request = beginSkillsMcpRequest();
+    const actionToken = beginActionBusy("checkSkillUpdates");
     setError("");
     try {
-      const result = await invoke<SkillsMcpState>("check_skill_updates", { configDir: configDir || null });
+      const result = await invoke<SkillsMcpState>("check_skill_updates", { configDir: request.configDir });
+      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
+      skillsMcpLoadedRef.current = request.configDirKey;
       setSkillsMcpState(result);
       setToast(lang === "zh" ? "Skills 更新状态已刷新" : "Skill update status refreshed");
     } catch (e) {
-      setError(String(e));
+      if (isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) setError(String(e));
     } finally {
-      setActionBusy("");
+      endActionBusy(actionToken);
     }
   };
 
   const toggleSkillEnabled = async (id: string, enabled: boolean) => {
-    setActionBusy(`skill:${id}`);
+    const request = beginSkillsMcpRequest();
+    const actionToken = beginActionBusy(`skill:${id}`);
     setError("");
     try {
-      const result = await invoke<SkillsMcpState>("toggle_codex_skill", { configDir: configDir || null, id, enabled });
+      const result = await invoke<SkillsMcpState>("toggle_codex_skill", { configDir: request.configDir, id, enabled });
+      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
+      skillsMcpLoadedRef.current = request.configDirKey;
       setSkillsMcpState(result);
       setToast(enabled ? (lang === "zh" ? "Skill 已启用" : "Skill enabled") : (lang === "zh" ? "Skill 已禁用" : "Skill disabled"));
     } catch (e) {
-      setError(String(e));
+      if (isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) setError(String(e));
     } finally {
-      setActionBusy("");
+      endActionBusy(actionToken);
     }
   };
 
   const toggleMcpEnabled = async (id: string, enabled: boolean) => {
-    setActionBusy(`mcp:${id}`);
+    const request = beginSkillsMcpRequest();
+    const actionToken = beginActionBusy(`mcp:${id}`);
     setError("");
     try {
-      const result = await invoke<SkillsMcpState>("toggle_codex_mcp", { configDir: configDir || null, id, enabled });
+      const result = await invoke<SkillsMcpState>("toggle_codex_mcp", { configDir: request.configDir, id, enabled });
+      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
+      skillsMcpLoadedRef.current = request.configDirKey;
       setSkillsMcpState(result);
       setToast(enabled ? (lang === "zh" ? "MCP 已启用" : "MCP enabled") : (lang === "zh" ? "MCP 已禁用" : "MCP disabled"));
     } catch (e) {
-      setError(String(e));
+      if (isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) setError(String(e));
     } finally {
-      setActionBusy("");
+      endActionBusy(actionToken);
     }
   };
 
@@ -1824,17 +2067,21 @@ function App() {
       setError(lang === "zh" ? "ZIP 技能包不能超过 20MB" : "Skill ZIP must be smaller than 20MB");
       return;
     }
-    setActionBusy("installSkillZip");
+    const request = beginSkillsMcpRequest();
+    const actionToken = beginActionBusy("installSkillZip");
     setError("");
     try {
       const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-      const result = await invoke<SkillsMcpActionResult>("install_skill_zip", { configDir: configDir || null, fileName: file.name, bytes });
+      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
+      const result = await invoke<SkillsMcpActionResult>("install_skill_zip", { configDir: request.configDir, fileName: file.name, bytes });
+      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return;
+      skillsMcpLoadedRef.current = request.configDirKey;
       setSkillsMcpState(result.state);
       setToast(result.message);
     } catch (e) {
-      setError(String(e));
+      if (isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) setError(String(e));
     } finally {
-      setActionBusy("");
+      endActionBusy(actionToken);
       if (skillZipImportRef.current) skillZipImportRef.current.value = "";
     }
   };
@@ -1842,29 +2089,32 @@ function App() {
   const officialAuthPlaceholder = '{\n  "OPENAI_API_KEY": null,\n  "auth_mode": "chatgpt",\n  "tokens": {\n    "access_token": "",\n    "refresh_token": "",\n    "id_token": ""\n  }\n}';
 
   const openOfficialEdit = async () => {
+    const requestId = ++officialDraftRequestRef.current;
+    const actionToken = beginActionBusy("loadOfficialDraft");
     const liveIsOfficial = Boolean(state?.isOfficialProvider);
+    const fallbackModel = state?.model || "gpt-5.5";
     setEditingDetectedProvider(false);
     setOfficialForm({
-      model: state?.model || "gpt-5.5",
+      model: fallbackModel,
       authJson: liveIsOfficial && state?.authText ? state.authText : officialAuthPlaceholder,
     });
     setProviderMode("official");
-    setActionBusy("loadOfficialDraft");
     setError("");
     try {
       const draft = await invoke<OfficialConfigDraft | null>("get_official_config_draft", {
         configDir: configDir || null,
       });
+      if (requestId !== officialDraftRequestRef.current) return;
       if (draft) {
         setOfficialForm({
-          model: draft.model || state?.model || "gpt-5.5",
+          model: draft.model || fallbackModel,
           authJson: draft.authJson,
         });
       }
     } catch (e) {
-      setError(String(e));
+      if (requestId === officialDraftRequestRef.current) setError(String(e));
     } finally {
-      setActionBusy("");
+      endActionBusy(actionToken);
     }
   };
 
@@ -1885,12 +2135,13 @@ function App() {
     );
 
   const openAddProvider = () => {
-    const next = { ...blankProviderForm };
+    const liveToml = state?.configText?.trim() || "";
+    const next = { ...blankProviderForm, tomlConfig: liveToml };
     resetAvailableProviderModels();
     setEditingProviderId(null);
     setEditingDetectedProvider(false);
     setProviderForm(next);
-    setProviderTomlDraft(buildProviderTomlPreview(next));
+    setProviderTomlDraft(liveToml || buildProviderTomlPreview(next));
     setProviderTomlDirty(false);
     setProviderMode("form");
   };
@@ -1901,7 +2152,7 @@ function App() {
     setEditingDetectedProvider(false);
     setProviderForm(provider);
     setProviderTomlDraft(provider.tomlConfig?.trim() || buildProviderTomlPreview(provider));
-    setProviderTomlDirty(Boolean(provider.tomlConfig?.trim()));
+    setProviderTomlDirty(false);
     setProviderMode("form");
   };
 
@@ -1919,18 +2170,18 @@ function App() {
       baseUrl: provider.baseUrl,
       model: provider.model,
       apiKey: provider.apiKey || "",
-      tomlConfig: "",
+      tomlConfig: state?.configText?.trim() || "",
       wireApi: provider.wireApi || "responses",
       requiresOpenaiAuth: provider.requiresOpenaiAuth,
     };
     setProviderForm(next);
-    setProviderTomlDraft(buildProviderTomlPreview(next));
+    setProviderTomlDraft(next.tomlConfig || buildProviderTomlPreview(next));
     setProviderTomlDirty(false);
     setProviderMode("form");
   };
 
   const removeProvider = async (id: string, isCurrent: boolean) => {
-    setLoading(true);
+    const loadingToken = beginLoading();
     setError("");
     try {
       if (isCurrent) {
@@ -1948,12 +2199,13 @@ function App() {
       setError(String(e));
       return false;
     } finally {
-      setLoading(false);
+      endLoading(loadingToken);
     }
   };
 
   const checkSessions = async () => {
-    setActionBusy("checkSessions");
+    sessionLoadRequestRef.current += 1;
+    const actionToken = beginActionBusy("checkSessions");
     setSessionStatus(null);
     await call(
       () => invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || null, targetProvider: null }),
@@ -1970,11 +2222,36 @@ function App() {
           : (lang === "zh" ? "全部会话已同步" : "All sessions are synced"));
       },
     );
-    setActionBusy("");
+    endActionBusy(actionToken);
   };
 
+  React.useEffect(() => {
+    if (tab !== "sessions" || refreshing || !state?.codexDir) return;
+    const loadKey = state.codexDir;
+    if (sessionAutoLoadKeyRef.current === loadKey) return;
+    const requestId = ++sessionLoadRequestRef.current;
+    const actionToken = beginActionBusy("checkSessions");
+    sessionAutoLoadKeyRef.current = loadKey;
+    void invoke<SessionSyncStatus>("get_session_sync_status", {
+      configDir: loadKey,
+      targetProvider: null,
+    })
+      .then((status) => {
+        if (requestId === sessionLoadRequestRef.current) setSessionStatus(status);
+      })
+      .catch((sessionError) => {
+        if (requestId !== sessionLoadRequestRef.current) return;
+        sessionAutoLoadKeyRef.current = "";
+        setError(String(sessionError));
+      })
+      .finally(() => {
+        endActionBusy(actionToken);
+      });
+  }, [beginActionBusy, endActionBusy, refreshing, state?.codexDir, tab]);
+
   const syncSessions = async () => {
-    setActionBusy("syncSessions");
+    sessionLoadRequestRef.current += 1;
+    const actionToken = beginActionBusy("syncSessions");
     await call(
       () => invoke<SessionSyncResult>("sync_sessions_provider", { configDir: configDir || null, targetProvider: null }),
       (result) => {
@@ -1994,7 +2271,7 @@ function App() {
         }
       },
     );
-    setActionBusy("");
+    endActionBusy(actionToken);
   };
 
   const toggleSessionSelected = (id: string) => {
@@ -2061,20 +2338,23 @@ function App() {
     }, 260);
   };
 
+  const changeTab = (nextTab: Tab) => {
+    if (nextTab !== "provider") {
+      officialDraftRequestRef.current += 1;
+      clearActionBusy("loadOfficialDraft");
+    }
+    setTab(nextTab);
+  };
+
   return (
     <AppShell
       activeTab={tab}
-      onTabChange={(nextTab) => {
-        if (!state && nextTab !== "dashboard" && nextTab !== "settings" && nextTab !== "about") {
-          setTab("dashboard");
-          return;
-        }
-        setTab(nextTab);
-      }}
+      onTabChange={changeTab}
       lang={lang}
       theme={theme}
       onToggleTheme={toggleTheme}
-      codexVersion={aboutInfo?.codexVersion}
+      codexVersion={aboutInfo?.codexVersion
+        || (aboutLoading ? (lang === "zh" ? "正在检测..." : "Detecting...") : undefined)}
       appVersion={aboutInfo?.appVersion}
       hasUpdate={Boolean(releaseInfo.hasUpdate)}
       updatePhase={updater.state.phase}
@@ -2117,24 +2397,29 @@ function App() {
         closing={startupClosing}
         lang={lang}
         diagnostics={startupDiagnostics}
-        configDir={configDir}
-        loading={loading}
-        onConfigDirChange={setConfigDir}
-        onRecheck={refresh}
+        configDir={configDirDraft}
+        loading={loading || refreshing}
+        onConfigDirChange={setConfigDirDraft}
+        onRecheck={() => refresh(true)}
         onSkip={closeStartupWizard}
         onOpenSettings={() => {
-          setTab("settings");
+          changeTab("settings");
           closeStartupWizard();
         }}
         onEnter={closeStartupWizard}
       />
 
       <PageTransition pageKey={tab}>
+            {!state && tab !== "dashboard" && tab !== "settings" && tab !== "about" && (
+              <CodexStateLoading lang={lang} loading={refreshing} />
+            )}
+
             {tab === "dashboard" && (
               <OverviewPage
                 lang={lang}
+                ready={Boolean(state)}
                 model={state?.model}
-                configDir={configDir}
+                configDir={configDirDraft}
                 resolvedCodexDir={state?.codexDir || ""}
                 configExists={Boolean(state?.configExists)}
                 providerLabel={currentProvider?.name || state?.modelProvider}
@@ -2148,11 +2433,11 @@ function App() {
                     ? `${state.agentsPath} (${lang === "zh" ? "追加模式" : "append"})`
                     : state.instructionFile)
                   : null}
-                loading={loading}
+                loading={loading || refreshing}
                 hasUpdate={Boolean(releaseInfo.status === "ok" && releaseInfo.hasUpdate)}
                 latestVersion={releaseInfo.latestVersion}
-                onConfigDirChange={setConfigDir}
-                onRefresh={refresh}
+                onConfigDirChange={setConfigDirDraft}
+                onRefresh={() => refresh(false)}
                 onOpenUpdate={() => setUpdatePromptOpen(true)}
               />
             )}
@@ -2227,6 +2512,7 @@ function App() {
                 onRestoreOfficial={restoreOfficialProvider}
                 onResetOfficial={resetOfficialProvider}
                 onCancelMode={() => {
+                  officialDraftRequestRef.current += 1;
                   setProviderMode("list");
                   setEditingDetectedProvider(false);
                   setProviderTomlDirty(false);
@@ -2253,12 +2539,19 @@ function App() {
                 onRequiresAuthChange={(value) => setProviderForm((current) => ({ ...current, requiresOpenaiAuth: value }))}
                 onToggleApiKeyVisibility={() => setProviderApiKeyVisible((value) => !value)}
                 onProviderTomlDraftChange={(value) => {
+                  providerDraftRequestRef.current += 1;
                   setProviderTomlDraft(value);
                   setProviderTomlDirty(true);
                 }}
                 onResetProviderToml={() => {
-                  setProviderTomlDraft(providerTomlPreview);
+                  providerDraftRequestRef.current += 1;
+                  setProviderTomlDraft(
+                    providerForm.tomlConfig?.trim()
+                    || state?.configText?.trim()
+                    || providerTomlPreview,
+                  );
                   setProviderTomlDirty(false);
+                  setProviderDraftRefreshToken((token) => token + 1);
                 }}
                 onSaveProvider={saveProviderConfig}
               />
@@ -2436,8 +2729,10 @@ function App() {
                   checkUpdateLabel: lang === "zh" ? "检查更新" : "Check updates",
                   openReleasesLabel: lang === "zh" ? "打开下载页" : "Open releases",
                 }}
-                appVersion={aboutInfo?.appVersion || "-"}
-                codexVersion={aboutInfo?.codexVersion || (lang === "zh" ? "未检测到" : "Not detected")}
+                appVersion={aboutInfo?.appVersion || (aboutLoading ? (lang === "zh" ? "正在检测" : "Detecting") : "-")}
+                codexVersion={aboutInfo?.codexVersion || (aboutLoading
+                  ? (lang === "zh" ? "正在检测..." : "Detecting...")
+                  : (lang === "zh" ? "未检测到" : "Not detected"))}
                 codexHome={aboutInfo?.codexDir || state?.codexDir || configDir || "~/.codex"}
                 projectUrl={aboutInfo?.projectUrl || `https://github.com/${FALLBACK_GITHUB_REPO}`}
                 release={{
@@ -2482,11 +2777,11 @@ function App() {
                   recheckLabel: lang === "zh" ? "重新检测" : "Recheck",
                 }}
                 onLanguageChange={setLang}
-                recheckBusy={loading}
+                recheckBusy={loading || refreshing}
                 onRecheck={() => {
                   localStorage.removeItem(STARTUP_WIZARD_SEEN_KEY);
                   setStartupWizardOpen(true);
-                  refresh();
+                  refresh(true);
                 }}
               />
             )}

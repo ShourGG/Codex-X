@@ -217,6 +217,7 @@ pub(crate) fn capture_live_official_config_before_provider_switch(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn capture_live_chatgpt_config(codex_dir: &Path) -> Result<bool> {
     capture_live_official_auth(codex_dir, is_chatgpt_auth)
 }
@@ -394,7 +395,9 @@ pub(crate) fn official_auth_available(codex_dir: &Path) -> Result<bool> {
             return Ok(true);
         }
     }
-    Ok(latest_official_backup(codex_dir)?.is_some())
+    // Historical backup discovery is intentionally deferred to restore. A
+    // status refresh must not traverse every backup on the startup path.
+    Ok(false)
 }
 
 pub(crate) fn get_official_config_draft_inner(

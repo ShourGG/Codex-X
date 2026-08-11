@@ -1,9 +1,11 @@
 import {
   ArrowUpRight,
   CheckCircle2,
+  CircleAlert,
   Code2,
   FileText,
   KeyRound,
+  Loader2,
   RefreshCw,
   Sparkles,
 } from "lucide-react";
@@ -14,6 +16,7 @@ export type OverviewLanguage = "zh" | "en";
 
 export type OverviewPageProps = {
   lang: OverviewLanguage;
+  ready: boolean;
   model?: string | null;
   configDir: string;
   resolvedCodexDir: string;
@@ -70,6 +73,7 @@ function ConfigRow({ label, value }: ConfigRowProps) {
 
 export function OverviewPage({
   lang,
+  ready,
   model,
   configDir,
   resolvedCodexDir,
@@ -121,6 +125,8 @@ export function OverviewPage({
         model: "模型",
         providerName: "供应商标识",
         instructionFile: "指令文件",
+        reading: "正在读取",
+        readFailed: "读取失败",
       }
     : {
         eyebrow: "CODEX CONFIG MANAGER",
@@ -153,20 +159,29 @@ export function OverviewPage({
         model: "Model",
         providerName: "Provider",
         instructionFile: "Instruction file",
+        reading: "Loading",
+        readFailed: "Load failed",
       };
 
-  const displayModel = model?.trim() || text.modelMissing;
-  const displayProvider = providerLabel?.trim() || modelProvider?.trim() || text.official;
-  const displayModelProvider = modelProvider?.trim() || text.notConfigured;
-  const displayDirectory = resolvedCodexDir.trim() || configDir.trim() || text.notConfigured;
-  const displayConfigPath = configPath?.trim() || text.notConfigured;
-  const displayInstructionPath = instructionPath?.trim() || text.notConfigured;
+  const unresolvedStatus = loading ? text.reading : text.readFailed;
+  const displayModel = ready ? (model?.trim() || text.modelMissing) : unresolvedStatus;
+  const displayProvider = ready
+    ? (providerLabel?.trim() || modelProvider?.trim() || text.official)
+    : unresolvedStatus;
+  const displayModelProvider = ready ? (modelProvider?.trim() || text.notConfigured) : unresolvedStatus;
+  const displayDirectory = ready
+    ? (resolvedCodexDir.trim() || configDir.trim() || text.notConfigured)
+    : (configDir.trim() || unresolvedStatus);
+  const displayConfigPath = ready ? (configPath?.trim() || text.notConfigured) : unresolvedStatus;
+  const displayInstructionPath = ready ? (instructionPath?.trim() || text.notConfigured) : unresolvedStatus;
   const updateVersion = latestVersion?.trim() || "";
-  const homeInputValue = configDir || resolvedCodexDir;
-  const authAvailable = authExists || officialAuthAvailable;
-  const authStatus = authExists
-    ? text.authFile
-    : officialAuthAvailable ? text.officialAuth : text.noAuth;
+  const homeInputValue = configDir;
+  const authAvailable = ready && (authExists || officialAuthAvailable);
+  const authStatus = ready
+    ? authExists
+      ? text.authFile
+      : officialAuthAvailable ? text.officialAuth : text.noAuth
+    : unresolvedStatus;
 
   return (
     <section className="cx-overview-page" aria-label={isChinese ? "概览" : "Overview"}>
@@ -187,6 +202,7 @@ export function OverviewPage({
             value={homeInputValue}
             onChange={(event) => onConfigDirChange(event.target.value)}
             placeholder={text.directoryPlaceholder}
+            disabled={loading}
             spellCheck={false}
             aria-label={text.codexHome}
           />
@@ -217,20 +233,20 @@ export function OverviewPage({
         <StatusCard
           icon={FileText}
           label={text.config}
-          value={configExists ? text.found : text.missing}
-          tone={configExists ? "success" : "muted"}
+          value={ready ? (configExists ? text.found : text.missing) : unresolvedStatus}
+          tone={ready && configExists ? "success" : "muted"}
         />
         <StatusCard
           icon={Code2}
           label={text.provider}
           value={displayProvider}
-          tone={modelProvider ? "active" : "muted"}
+          tone={ready && modelProvider ? "active" : "muted"}
         />
         <StatusCard
           icon={Sparkles}
           label={text.instruction}
-          value={instructionEnabled ? text.enabled : text.disabled}
-          tone={instructionEnabled ? "success" : "muted"}
+          value={ready ? (instructionEnabled ? text.enabled : text.disabled) : unresolvedStatus}
+          tone={ready && instructionEnabled ? "success" : "muted"}
         />
         <StatusCard
           icon={KeyRound}
@@ -246,9 +262,13 @@ export function OverviewPage({
             <p className="cx-overview-section-label">{text.liveStatus}</p>
             <h3>{text.currentConfig}</h3>
           </div>
-          <span className={`cx-overview-instruction-pill${instructionEnabled ? " cx-overview-instruction-pill--active" : ""}`}>
-            <CheckCircle2 size={14} strokeWidth={2} aria-hidden="true" />
-            {instructionEnabled ? text.on : text.off}
+          <span className={`cx-overview-instruction-pill${ready && instructionEnabled ? " cx-overview-instruction-pill--active" : ""}`}>
+            {!ready && loading
+              ? <Loader2 className="cx-overview-spin" size={14} strokeWidth={2} aria-hidden="true" />
+              : !ready
+                ? <CircleAlert size={14} strokeWidth={2} aria-hidden="true" />
+                : <CheckCircle2 size={14} strokeWidth={2} aria-hidden="true" />}
+            {ready ? (instructionEnabled ? text.on : text.off) : unresolvedStatus}
           </span>
         </div>
 

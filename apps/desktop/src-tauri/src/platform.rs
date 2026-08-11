@@ -1,7 +1,11 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{mpsc, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use std::env;
@@ -11,6 +15,13 @@ const WINDOWS_CODEX_PACKAGE_IDENTITIES: &[&str] =
     &["OpenAI.Codex", "OpenAI.CodexBeta", "OpenAI.ChatGPT-Desktop"];
 #[cfg(target_os = "windows")]
 const WINDOWS_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe", "codex.exe"];
+
+const CODEX_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROGRAM_TIMEOUT: Duration = Duration::from_secs(2);
+const PROGRAM_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CHILD_TERMINATION_GRACE: Duration = Duration::from_millis(250);
+
+static CODEX_VERSION: OnceLock<String> = OnceLock::new();
 
 fn version_line(stdout: &str, stderr: &str, success: bool) -> Option<String> {
     let lines = stdout.lines().chain(stderr.lines()).map(str::trim);
@@ -79,14 +90,142 @@ pub fn program_command(program: &Path, args: &[&str]) -> Command {
     command
 }
 
-fn run_program(program: &Path, args: &[&str]) -> Option<Output> {
-    program_command(program, args).output().ok()
+fn remaining_timeout(deadline: Option<Instant>, maximum: Duration) -> Option<Duration> {
+    let remaining = deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(maximum)
+        .min(maximum);
+    (!remaining.is_zero()).then_some(remaining)
 }
 
-fn command_version(program: &Path) -> Option<String> {
-    run_program(program, &["--version"])
+fn deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn wait_for_child_exit(child: &mut Child, deadline: Instant) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(PROGRAM_POLL_INTERVAL));
+            }
+            Ok(None) => return,
+        }
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let pid = child.id().to_string();
+        let mut taskkill = Command::new("taskkill.exe");
+        taskkill
+            .args(["/PID", pid.as_str(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        if let Ok(mut killer) = taskkill.spawn() {
+            let deadline = Instant::now() + CHILD_TERMINATION_GRACE;
+            wait_for_child_exit(&mut killer, deadline);
+            let _ = killer.kill();
+        }
+    }
+
+    let _ = child.kill();
+    wait_for_child_exit(child, Instant::now() + CHILD_TERMINATION_GRACE);
+}
+
+fn output_reader<R>(mut stream: R) -> Option<mpsc::Receiver<Option<Vec<u8>>>>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("codex-version-output".to_string())
+        .spawn(move || {
+            let mut output = Vec::new();
+            let result = stream.read_to_end(&mut output).ok().map(|_| output);
+            let _ = sender.send(result);
+        })
+        .ok()?;
+    Some(receiver)
+}
+
+fn receive_output(
+    receiver: &mpsc::Receiver<Option<Vec<u8>>>,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    match receiver.try_recv() {
+        Ok(output) => output,
+        Err(mpsc::TryRecvError::Disconnected) => None,
+        Err(mpsc::TryRecvError::Empty) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            (!remaining.is_zero())
+                .then(|| receiver.recv_timeout(remaining).ok().flatten())
+                .flatten()
+        }
+    }
+}
+
+fn run_program(program: &Path, args: &[&str], deadline: Option<Instant>) -> Option<Output> {
+    let timeout = remaining_timeout(deadline, PROGRAM_TIMEOUT)?;
+    let command_deadline = Instant::now().checked_add(timeout)?;
+    let mut command = program_command(program, args);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+
+    let Some(stdout) = child.stdout.take() else {
+        terminate_child(&mut child);
+        return None;
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_child(&mut child);
+        return None;
+    };
+    // Drain both pipes while polling so verbose commands cannot block on a full pipe buffer.
+    let Some(stdout_receiver) = output_reader(stdout) else {
+        terminate_child(&mut child);
+        return None;
+    };
+    let Some(stderr_receiver) = output_reader(stderr) else {
+        terminate_child(&mut child);
+        return None;
+    };
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < command_deadline => {
+                let remaining = command_deadline.saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(PROGRAM_POLL_INTERVAL));
+            }
+            Ok(None) | Err(_) => {
+                terminate_child(&mut child);
+                return None;
+            }
+        }
+    };
+    let stdout = receive_output(&stdout_receiver, command_deadline)?;
+    let stderr = receive_output(&stderr_receiver, command_deadline)?;
+    Some(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn command_version(program: &Path, deadline: Option<Instant>) -> Option<String> {
+    run_program(program, &["--version"], deadline)
         .and_then(version_from_output)
-        .or_else(|| run_program(program, &["-V"]).and_then(version_from_output))
+        .or_else(|| run_program(program, &["-V"], deadline).and_then(version_from_output))
 }
 
 fn candidate_key(path: &Path) -> String {
@@ -143,34 +282,59 @@ fn latest_windows_package_version<'a>(
 }
 
 #[cfg(target_os = "windows")]
-fn windows_store_app_version_from_roots(roots: &[PathBuf]) -> Option<String> {
+fn windows_store_app_version_from_roots(
+    roots: &[PathBuf],
+    deadline: Option<Instant>,
+) -> Option<String> {
     let mut package_names = Vec::new();
     for root in roots {
+        if deadline_expired(deadline) {
+            break;
+        }
         let Ok(entries) = fs::read_dir(root) else {
             continue;
         };
-        package_names.extend(entries.flatten().filter_map(|entry| {
-            entry
-                .path()
-                .is_dir()
-                .then(|| entry.file_name().to_string_lossy().to_string())
-        }));
+        for entry in entries.flatten() {
+            if deadline_expired(deadline) {
+                break;
+            }
+            if entry.path().is_dir() {
+                package_names.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
     }
     latest_windows_package_version(package_names.iter().map(String::as_str))
         .map(|version| format!("Codex app {version}"))
 }
 
-fn collect_named_files(root: &Path, names: &[&str], depth: usize, output: &mut Vec<PathBuf>) {
-    if depth == 0 || !root.is_dir() {
-        return;
+fn visit_named_files<F>(
+    root: &Path,
+    names: &[&str],
+    depth: usize,
+    deadline: Option<Instant>,
+    visit: &mut F,
+) -> bool
+where
+    F: FnMut(PathBuf) -> bool,
+{
+    if depth == 0 || deadline_expired(deadline) {
+        return !deadline_expired(deadline);
+    }
+    if !root.is_dir() {
+        return !deadline_expired(deadline);
     }
     let Ok(entries) = fs::read_dir(root) else {
-        return;
+        return !deadline_expired(deadline);
     };
     for entry in entries.flatten() {
+        if deadline_expired(deadline) {
+            return false;
+        }
         let path = entry.path();
         if path.is_dir() {
-            collect_named_files(&path, names, depth - 1, output);
+            if !visit_named_files(&path, names, depth - 1, deadline, visit) {
+                return false;
+            }
         } else if path.is_file()
             && path
                 .file_name()
@@ -180,55 +344,81 @@ fn collect_named_files(root: &Path, names: &[&str], depth: usize, output: &mut V
                         .iter()
                         .any(|candidate| name.eq_ignore_ascii_case(candidate))
                 })
+            && !visit(path)
         {
-            output.push(path);
+            return false;
         }
     }
+    !deadline_expired(deadline)
 }
 
-fn extension_codex_candidates(home: &Path) -> Vec<PathBuf> {
+fn visit_extension_codex_candidates<F>(
+    home: &Path,
+    deadline: Option<Instant>,
+    visit: &mut F,
+) -> bool
+where
+    F: FnMut(PathBuf) -> bool,
+{
     let roots = [
         home.join(".cursor").join("extensions"),
         home.join(".vscode").join("extensions"),
         home.join(".vscode-insiders").join("extensions"),
         home.join(".windsurf").join("extensions"),
     ];
-    let mut candidates = Vec::new();
     for root in roots {
+        if deadline_expired(deadline) {
+            return false;
+        }
         let Ok(entries) = fs::read_dir(root) else {
             continue;
         };
-        let mut extension_dirs = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_dir()
-                    && path
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|name| {
-                            let lower = name.to_ascii_lowercase();
-                            lower.starts_with("openai.chatgpt-")
-                                || lower.starts_with("openai.codex-")
-                        })
-            })
-            .collect::<Vec<_>>();
+        let mut extension_dirs = Vec::new();
+        for entry in entries.flatten() {
+            if deadline_expired(deadline) {
+                break;
+            }
+            let path = entry.path();
+            if path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| {
+                        let lower = name.to_ascii_lowercase();
+                        lower.starts_with("openai.chatgpt-") || lower.starts_with("openai.codex-")
+                    })
+            {
+                extension_dirs.push(path);
+            }
+        }
+        if deadline_expired(deadline) {
+            return false;
+        }
         extension_dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
         for extension_dir in extension_dirs {
-            collect_named_files(
+            if deadline_expired(deadline) {
+                return false;
+            }
+            if !visit_named_files(
                 &extension_dir,
                 &["codex", "codex.exe", "codex.cmd"],
                 5,
-                &mut candidates,
-            );
+                deadline,
+                visit,
+            ) {
+                return false;
+            }
         }
     }
-    candidates
+    true
 }
 
 #[cfg(target_os = "macos")]
-fn platform_candidates(home: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![
+fn visit_platform_candidates<F>(home: &Path, deadline: Option<Instant>, visit: &mut F) -> bool
+where
+    F: FnMut(PathBuf) -> bool,
+{
+    let candidates = [
         PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
         home.join("Applications/ChatGPT.app/Contents/Resources/codex"),
         PathBuf::from("/Applications/Codex.app/Contents/Resources/codex"),
@@ -245,30 +435,49 @@ fn platform_candidates(home: &Path) -> Vec<PathBuf> {
         home.join(".npm-global/bin/codex"),
         home.join("Library/pnpm/codex"),
     ];
-    candidates.extend(extension_codex_candidates(home));
-    candidates
+    for candidate in candidates {
+        if deadline_expired(deadline) || !visit(candidate) {
+            return false;
+        }
+    }
+    visit_extension_codex_candidates(home, deadline, visit)
 }
 
 #[cfg(target_os = "windows")]
-fn platform_candidates(home: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
+fn visit_platform_candidates<F>(home: &Path, deadline: Option<Instant>, visit: &mut F) -> bool
+where
+    F: FnMut(PathBuf) -> bool,
+{
     if let Ok(appdata) = env::var("APPDATA") {
         let appdata = PathBuf::from(appdata);
-        candidates.push(appdata.join("npm").join("codex.cmd"));
-        candidates.push(appdata.join("npm").join("codex.exe"));
+        for candidate in [
+            appdata.join("npm").join("codex.cmd"),
+            appdata.join("npm").join("codex.exe"),
+        ] {
+            if deadline_expired(deadline) || !visit(candidate) {
+                return false;
+            }
+        }
         for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
-            candidates.push(
-                appdata
-                    .join("npm/node_modules/@openai/codex/vendor")
-                    .join(target)
-                    .join("codex/codex.exe"),
-            );
+            let candidate = appdata
+                .join("npm/node_modules/@openai/codex/vendor")
+                .join(target)
+                .join("codex/codex.exe");
+            if deadline_expired(deadline) || !visit(candidate) {
+                return false;
+            }
         }
     }
     if let Ok(localappdata) = env::var("LOCALAPPDATA") {
         let localappdata = PathBuf::from(localappdata);
-        candidates.push(localappdata.join("Microsoft/WindowsApps/codex.exe"));
-        candidates.push(localappdata.join("Microsoft/WindowsApps/codex.cmd"));
+        for candidate in [
+            localappdata.join("Microsoft/WindowsApps/codex.exe"),
+            localappdata.join("Microsoft/WindowsApps/codex.cmd"),
+        ] {
+            if deadline_expired(deadline) || !visit(candidate) {
+                return false;
+            }
+        }
         for root in [
             localappdata.join("Programs/ChatGPT"),
             localappdata.join("Programs/Codex"),
@@ -276,28 +485,35 @@ fn platform_candidates(home: &Path) -> Vec<PathBuf> {
             localappdata.join("OpenAI/ChatGPT"),
             localappdata.join("OpenAI/Codex"),
         ] {
-            collect_named_files(&root, &["codex.exe", "codex.cmd"], 7, &mut candidates);
+            if !visit_named_files(&root, &["codex.exe", "codex.cmd"], 7, deadline, visit) {
+                return false;
+            }
         }
     }
     for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
         if let Ok(program_files) = env::var(variable) {
             for app in ["ChatGPT", "Codex"] {
-                collect_named_files(
+                if !visit_named_files(
                     &PathBuf::from(&program_files).join(app),
                     &["codex.exe", "codex.cmd"],
                     7,
-                    &mut candidates,
-                );
+                    deadline,
+                    visit,
+                ) {
+                    return false;
+                }
             }
         }
     }
-    candidates.extend(extension_codex_candidates(home));
-    candidates
+    visit_extension_codex_candidates(home, deadline, visit)
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-fn platform_candidates(home: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![
+fn visit_platform_candidates<F>(home: &Path, deadline: Option<Instant>, visit: &mut F) -> bool
+where
+    F: FnMut(PathBuf) -> bool,
+{
+    let candidates = [
         PathBuf::from("/usr/local/bin/codex"),
         PathBuf::from("/usr/bin/codex"),
         PathBuf::from("/snap/bin/codex"),
@@ -305,21 +521,17 @@ fn platform_candidates(home: &Path) -> Vec<PathBuf> {
         home.join(".npm-global/bin/codex"),
         home.join(".local/share/pnpm/codex"),
     ];
-    candidates.extend(extension_codex_candidates(home));
-    candidates
+    for candidate in candidates {
+        if deadline_expired(deadline) || !visit(candidate) {
+            return false;
+        }
+    }
+    visit_extension_codex_candidates(home, deadline, visit)
 }
 
 #[cfg(target_os = "windows")]
-fn windows_where_candidates() -> Vec<PathBuf> {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    let mut command = Command::new("where.exe");
-    let Ok(output) = command
-        .creation_flags(CREATE_NO_WINDOW)
-        .arg("codex")
-        .output()
-    else {
+fn windows_where_candidates(deadline: Option<Instant>) -> Vec<PathBuf> {
+    let Some(output) = run_program(Path::new("where.exe"), &["codex"], deadline) else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -334,12 +546,12 @@ fn windows_where_candidates() -> Vec<PathBuf> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn windows_where_candidates() -> Vec<PathBuf> {
+fn windows_where_candidates(_deadline: Option<Instant>) -> Vec<PathBuf> {
     Vec::new()
 }
 
 #[cfg(target_os = "macos")]
-fn macos_app_version() -> Option<String> {
+fn macos_app_version(deadline: Option<Instant>) -> Option<String> {
     let home = dirs::home_dir().unwrap_or_default();
     for root in [PathBuf::from("/Applications"), home.join("Applications")] {
         for name in [
@@ -349,6 +561,9 @@ fn macos_app_version() -> Option<String> {
             "ChatGPT Codex.app",
             "ChatGPT.app",
         ] {
+            if deadline_expired(deadline) {
+                return None;
+            }
             let app = root.join(name);
             if !app.is_dir() {
                 continue;
@@ -360,8 +575,11 @@ fn macos_app_version() -> Option<String> {
             };
             if let Some(version) = macos_info_plist_version(&app).or_else(|| {
                 let app = app.to_str()?;
-                let output =
-                    run_program(Path::new("mdls"), &["-name", "kMDItemVersion", "-raw", app])?;
+                let output = run_program(
+                    Path::new("mdls"),
+                    &["-name", "kMDItemVersion", "-raw", app],
+                    deadline,
+                )?;
                 output
                     .status
                     .success()
@@ -394,12 +612,12 @@ fn plist_string_value(plist: &str, key: &str) -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn macos_app_version() -> Option<String> {
+fn macos_app_version(_deadline: Option<Instant>) -> Option<String> {
     None
 }
 
 #[cfg(target_os = "windows")]
-fn windows_app_version() -> Option<String> {
+fn windows_app_version(deadline: Option<Instant>) -> Option<String> {
     let mut roots = Vec::new();
     for variable in ["ProgramFiles", "ProgramW6432"] {
         if let Ok(program_files) = env::var(variable) {
@@ -409,14 +627,19 @@ fn windows_app_version() -> Option<String> {
     roots.push(PathBuf::from(r"C:\Program Files\WindowsApps"));
     roots.sort();
     roots.dedup();
-    if let Some(version) = windows_store_app_version_from_roots(&roots) {
+    if let Some(version) = windows_store_app_version_from_roots(&roots, deadline) {
         return Some(version);
+    }
+
+    if deadline_expired(deadline) {
+        return None;
     }
 
     let script = "Get-AppxPackage | Where-Object { $_.Name -in @('OpenAI.Codex','OpenAI.CodexBeta','OpenAI.ChatGPT-Desktop') } | ForEach-Object { $_.Version.ToString() }";
     if let Some(output) = run_program(
         Path::new("powershell.exe"),
         &["-NoProfile", "-NonInteractive", "-Command", script],
+        deadline,
     ) {
         if output.status.success() {
             let versions = String::from_utf8_lossy(&output.stdout)
@@ -440,6 +663,9 @@ fn windows_app_version() -> Option<String> {
         local_appdata.join("Programs/OpenAI/Codex"),
         local_appdata.join("Programs/Codex"),
     ] {
+        if deadline_expired(deadline) {
+            return None;
+        }
         if WINDOWS_CODEX_EXECUTABLES.iter().any(|name| {
             directory.join(name).is_file() || directory.join("app").join(name).is_file()
         }) {
@@ -450,41 +676,143 @@ fn windows_app_version() -> Option<String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn windows_app_version() -> Option<String> {
+fn windows_app_version(_deadline: Option<Instant>) -> Option<String> {
     None
 }
 
-pub fn codex_executable_candidates() -> Vec<PathBuf> {
-    let home = dirs::home_dir().unwrap_or_default();
+fn path_codex_candidates(deadline: Option<Instant>) -> Vec<PathBuf> {
     let mut candidates = ["codex", "codex.exe", "codex.cmd"]
         .into_iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    candidates.extend(windows_where_candidates());
-    candidates.extend(platform_candidates(&home));
+    if !deadline_expired(deadline) {
+        candidates.extend(windows_where_candidates(deadline));
+    }
+    candidates
+}
+
+fn append_unique_candidates(
+    unique: &mut Vec<PathBuf>,
+    seen: &mut HashSet<String>,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) {
+    for candidate in candidates {
+        push_candidate(unique, seen, candidate);
+    }
+}
+
+fn codex_executable_candidates_until(deadline: Option<Instant>) -> Vec<PathBuf> {
+    let home = dirs::home_dir().unwrap_or_default();
     let mut seen = HashSet::new();
     let mut unique = Vec::new();
-    for candidate in candidates {
-        push_candidate(&mut unique, &mut seen, candidate);
+    append_unique_candidates(&mut unique, &mut seen, path_codex_candidates(deadline));
+    if !deadline_expired(deadline) {
+        let mut collect = |candidate| {
+            if deadline_expired(deadline) {
+                return false;
+            }
+            push_candidate(&mut unique, &mut seen, candidate);
+            true
+        };
+        let _ = visit_platform_candidates(&home, deadline, &mut collect);
     }
     unique
 }
 
-pub fn detect_codex_version() -> Option<String> {
-    for candidate in codex_executable_candidates() {
+pub fn codex_executable_candidates() -> Vec<PathBuf> {
+    codex_executable_candidates_until(None)
+}
+
+fn version_from_candidates(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    seen: &mut HashSet<String>,
+    deadline: Instant,
+) -> Option<String> {
+    for candidate in candidates {
+        if deadline_expired(Some(deadline)) {
+            return None;
+        }
+        if !seen.insert(candidate_key(&candidate)) {
+            continue;
+        }
         let is_bare_command = candidate.components().count() == 1;
         if is_bare_command || candidate.is_file() {
-            if let Some(version) = command_version(&candidate) {
+            if let Some(version) = command_version(&candidate, Some(deadline)) {
                 return Some(version);
             }
         }
     }
-    macos_app_version().or_else(windows_app_version)
+    None
+}
+
+fn version_from_platform_candidates(
+    home: &Path,
+    seen: &mut HashSet<String>,
+    deadline: Instant,
+) -> Option<String> {
+    let mut detected = None;
+    let mut probe = |candidate| {
+        if deadline_expired(Some(deadline)) {
+            return false;
+        }
+        detected = version_from_candidates([candidate], seen, deadline);
+        detected.is_none() && !deadline_expired(Some(deadline))
+    };
+    let _ = visit_platform_candidates(home, Some(deadline), &mut probe);
+    detected
+}
+
+fn detect_codex_version_uncached() -> Option<String> {
+    let deadline = Instant::now().checked_add(CODEX_VERSION_PROBE_TIMEOUT)?;
+    let mut seen = HashSet::new();
+
+    // Probe cheap PATH/where.exe results before walking redirected profiles or slow disks.
+    if let Some(version) =
+        version_from_candidates(path_codex_candidates(Some(deadline)), &mut seen, deadline)
+    {
+        return Some(version);
+    }
+    if deadline_expired(Some(deadline)) {
+        return None;
+    }
+
+    let home = dirs::home_dir().unwrap_or_default();
+    if let Some(version) = version_from_platform_candidates(&home, &mut seen, deadline) {
+        return Some(version);
+    }
+    if deadline_expired(Some(deadline)) {
+        return None;
+    }
+    macos_app_version(Some(deadline)).or_else(|| windows_app_version(Some(deadline)))
+}
+
+fn cached_codex_version(
+    cache: &OnceLock<String>,
+    detect: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some(version) = cache.get() {
+        return Some(version.clone());
+    }
+    let detected = detect()?;
+    let _ = cache.set(detected.clone());
+    cache.get().cloned().or(Some(detected))
+}
+
+pub fn detect_codex_version() -> Option<String> {
+    cached_codex_version(&CODEX_VERSION, detect_codex_version_uncached)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{latest_windows_package_version, plist_string_value, version_line};
+    use super::{
+        cached_codex_version, latest_windows_package_version, plist_string_value, run_program,
+        version_line, visit_named_files,
+    };
+    use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn version_parser_prefers_codex_line_over_warning() {
@@ -513,6 +841,94 @@ mod tests {
             version_line("", "error: command not found 127\n", false),
             None
         );
+    }
+
+    #[test]
+    fn codex_version_cache_runs_probe_once() {
+        let cache = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+
+        let first = cached_codex_version(&cache, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some("codex-cli 1.2.3".to_string())
+        });
+        let second = cached_codex_version(&cache, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some("codex-cli 9.9.9".to_string())
+        });
+
+        assert_eq!(first.as_deref(), Some("codex-cli 1.2.3"));
+        assert_eq!(second, first);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn codex_version_cache_retries_after_a_missing_result() {
+        let cache = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+
+        assert_eq!(
+            cached_codex_version(&cache, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                None
+            }),
+            None
+        );
+        assert_eq!(
+            cached_codex_version(&cache, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some("codex-cli 1.2.3".to_string())
+            }),
+            Some("codex-cli 1.2.3".to_string())
+        );
+        assert_eq!(
+            cached_codex_version(&cache, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some("codex-cli 9.9.9".to_string())
+            }),
+            Some("codex-cli 1.2.3".to_string())
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn recursive_candidate_scan_stops_immediately_after_visitor_finishes() {
+        static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+        let root = std::env::temp_dir().join(format!(
+            "codex-x-platform-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("first")).expect("create first candidate directory");
+        fs::create_dir_all(root.join("second")).expect("create second candidate directory");
+        fs::write(root.join("first/codex.exe"), b"").expect("create first candidate");
+        fs::write(root.join("second/codex.exe"), b"").expect("create second candidate");
+
+        let mut visits = 0;
+        let completed = visit_named_files(&root, &["codex.exe"], 3, None, &mut |_| {
+            visits += 1;
+            false
+        });
+        fs::remove_dir_all(&root).expect("remove candidate test directory");
+
+        assert!(!completed);
+        assert_eq!(visits, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_runner_stops_hung_process_at_deadline() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+
+        assert!(run_program(
+            Path::new("/bin/sh"),
+            &["-c", "while :; do :; done"],
+            Some(deadline),
+        )
+        .is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

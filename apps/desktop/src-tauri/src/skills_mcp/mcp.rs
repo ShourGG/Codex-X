@@ -1,15 +1,24 @@
 use super::build_skills_mcp_state_inner;
 use super::types::{ManagedMcpServer, SkillsMcpState};
+use crate::backups::create_backup;
 use crate::ccswitch::default_ccswitch_db_path;
 use crate::error::{CodexxError, Result};
-use crate::file_io::{ensure_directory, parse_toml_document, read_to_string_if_exists, write_text};
+use crate::file_io::{ensure_directory, parse_toml_document, read_to_string_if_exists};
+use crate::live_config::{
+    acquire_live_config_lock, apply_file_change, fail_with_file_rollback, read_file_snapshot,
+    text_from_snapshot,
+};
 use crate::toml_utils::ensure_table;
 use crate::{config_path, now_rfc3339, open_db, resolve_codex_dir};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
 use toml_edit::{value, Item, Table};
+
+type CcSwitchMcpCandidate = (String, String, Value, bool);
 
 fn toml_value_to_json(value: &toml_edit::Value) -> Value {
     if let Some(s) = value.as_str() {
@@ -134,8 +143,13 @@ pub(super) fn mcp_summary(config: &Value) -> (String, Option<String>, Option<Str
     (transport, command, url, summary)
 }
 
-pub(super) fn save_managed_mcp(id: &str, name: &str, config: &Value, enabled: bool) -> Result<()> {
-    let conn = open_db()?;
+fn save_managed_mcp_on_connection(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    config: &Value,
+    enabled: bool,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO managed_mcp_servers (id, name, server_config, enabled, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -153,6 +167,83 @@ pub(super) fn save_managed_mcp(id: &str, name: &str, config: &Value, enabled: bo
         ],
     )
     .map_err(|e| CodexxError::Database(e.to_string()))?;
+    Ok(())
+}
+
+pub(super) fn save_managed_mcp(id: &str, name: &str, config: &Value, enabled: bool) -> Result<()> {
+    let conn = open_db()?;
+    save_managed_mcp_on_connection(&conn, id, name, config, enabled)
+}
+
+fn managed_mcp_on_connection(conn: &Connection, id: &str) -> Result<Option<(String, Value, bool)>> {
+    conn.query_row(
+        "SELECT name, server_config, enabled FROM managed_mcp_servers WHERE id = ?1 LIMIT 1",
+        [id],
+        |row| {
+            let config_text: String = row.get(1)?;
+            Ok((
+                row.get(0)?,
+                serde_json::from_str(&config_text).unwrap_or(Value::Object(Default::default())),
+                row.get(2)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|error| CodexxError::Database(error.to_string()))
+}
+
+fn document_mcp_ids(doc: &toml_edit::DocumentMut) -> HashSet<String> {
+    doc.get("mcp_servers")
+        .and_then(|item| item.as_table())
+        .map(|table| {
+            table
+                .iter()
+                .filter(|(_, item)| item.is_table())
+                .map(|(id, _)| id.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn document_bytes(snapshot: Option<&[u8]>, doc: &toml_edit::DocumentMut) -> Option<Vec<u8>> {
+    let bytes = doc.to_string().into_bytes();
+    if snapshot.is_none() && bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
+fn commit_mcp_transaction_with_config<BeforeApply, BeforeCommit>(
+    transaction: Transaction<'_>,
+    codex_dir: &Path,
+    before: Option<Vec<u8>>,
+    after: Option<Vec<u8>>,
+    backup_action: &str,
+    before_apply: BeforeApply,
+    before_commit: BeforeCommit,
+) -> Result<()>
+where
+    BeforeApply: FnOnce(&Path) -> Result<()>,
+    BeforeCommit: FnOnce(&Transaction<'_>) -> Result<()>,
+{
+    let cfg = config_path(codex_dir);
+    let mut changes = Vec::new();
+    if before != after {
+        create_backup(codex_dir, backup_action)?;
+        before_apply(&cfg)?;
+        changes.push(apply_file_change(&cfg, before, after)?);
+    }
+
+    if let Err(error) = before_commit(&transaction) {
+        return fail_with_file_rollback(error, &changes);
+    }
+    if let Err(error) = transaction
+        .commit()
+        .map_err(|error| CodexxError::Database(error.to_string()))
+    {
+        return fail_with_file_rollback(error, &changes);
+    }
     Ok(())
 }
 
@@ -264,36 +355,76 @@ pub(super) fn import_ccswitch_mcp_servers_for_codex(
             ))
         })
         .map_err(|e| CodexxError::Database(e.to_string()))?;
-
-    let cfg = config_path(codex_dir);
-    let text = read_to_string_if_exists(&cfg)?;
-    let mut doc = parse_toml_document(&cfg, &text)?;
-    let live_enabled = list_mcp_from_config(codex_dir)?
-        .into_iter()
-        .map(|server| server.id)
-        .collect::<HashSet<_>>();
-    let mut imported = 0usize;
-    let mut changed_config = false;
+    let mut candidates = Vec::new();
     for row in rows {
         let (id, name, config_text, enabled_codex) =
             row.map_err(|e| CodexxError::Database(e.to_string()))?;
         let config: Value =
             serde_json::from_str(&config_text).unwrap_or(Value::Object(Default::default()));
-        if !imported_ids.insert(id.clone()) {
-            continue;
-        }
-        let enabled = enabled_codex || live_enabled.contains(&id);
-        save_managed_mcp(&id, &name, &config, enabled)?;
-        if enabled_codex && !live_enabled.contains(&id) {
-            ensure_table(doc.as_table_mut(), "mcp_servers")?
-                .insert(&id, json_to_toml_item(&config));
-            changed_config = true;
-        }
-        imported += 1;
+        candidates.push((id, name, config, enabled_codex));
     }
-    if changed_config {
-        write_text(&cfg, &doc.to_string())?;
+
+    import_ccswitch_mcp_candidates_with_hooks(
+        codex_dir,
+        imported_ids,
+        candidates,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+fn import_ccswitch_mcp_candidates_with_hooks<BeforeApply, BeforeCommit>(
+    codex_dir: &Path,
+    imported_ids: &mut HashSet<String>,
+    candidates: Vec<CcSwitchMcpCandidate>,
+    before_apply: BeforeApply,
+    before_commit: BeforeCommit,
+) -> Result<usize>
+where
+    BeforeApply: FnOnce(&Path) -> Result<()>,
+    BeforeCommit: FnOnce(&Transaction<'_>) -> Result<()>,
+{
+    let mut staged_ids = HashSet::new();
+    let candidates = candidates
+        .into_iter()
+        .filter(|(id, _, _, _)| !imported_ids.contains(id) && staged_ids.insert(id.clone()))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(0);
     }
+
+    ensure_directory(codex_dir)?;
+    let _live_lock = acquire_live_config_lock(codex_dir)?;
+    let cfg = config_path(codex_dir);
+    let before = read_file_snapshot(&cfg)?;
+    let text = text_from_snapshot(&cfg, before.as_deref())?;
+    let mut doc = parse_toml_document(&cfg, &text)?;
+    let live_enabled = document_mcp_ids(&doc);
+
+    let mut app_conn = open_db()?;
+    let transaction = app_conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    for (id, name, config, enabled_codex) in &candidates {
+        let enabled = *enabled_codex || live_enabled.contains(id);
+        save_managed_mcp_on_connection(&transaction, id, name, config, enabled)?;
+        if *enabled_codex && !live_enabled.contains(id) {
+            ensure_table(doc.as_table_mut(), "mcp_servers")?.insert(id, json_to_toml_item(config));
+        }
+    }
+    let after = document_bytes(before.as_deref(), &doc);
+    commit_mcp_transaction_with_config(
+        transaction,
+        codex_dir,
+        before,
+        after,
+        "import-ccswitch-mcp",
+        before_apply,
+        before_commit,
+    )?;
+
+    let imported = candidates.len();
+    imported_ids.extend(staged_ids);
     Ok(imported)
 }
 
@@ -368,31 +499,287 @@ pub(crate) fn toggle_codex_mcp_inner(
     id: String,
     enabled: bool,
 ) -> Result<SkillsMcpState> {
+    toggle_codex_mcp_with_hooks(config_dir, id, enabled, |_| Ok(()), |_| Ok(()))
+}
+
+fn toggle_codex_mcp_with_hooks<BeforeApply, BeforeCommit>(
+    config_dir: Option<String>,
+    id: String,
+    enabled: bool,
+    before_apply: BeforeApply,
+    before_commit: BeforeCommit,
+) -> Result<SkillsMcpState>
+where
+    BeforeApply: FnOnce(&Path) -> Result<()>,
+    BeforeCommit: FnOnce(&Transaction<'_>) -> Result<()>,
+{
     let codex_dir = resolve_codex_dir(config_dir.clone())?;
     ensure_directory(&codex_dir)?;
+    let _live_lock = acquire_live_config_lock(&codex_dir)?;
     let cfg = config_path(&codex_dir);
-    let text = read_to_string_if_exists(&cfg)?;
+    let before = read_file_snapshot(&cfg)?;
+    let text = text_from_snapshot(&cfg, before.as_deref())?;
     let mut doc = parse_toml_document(&cfg, &text)?;
+
+    let mut conn = open_db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    let stored = managed_mcp_on_connection(&transaction, &id)?;
     if enabled {
-        let db = db_managed_mcp()?
-            .into_iter()
-            .find(|(sid, _, _, _)| sid == &id)
-            .ok_or_else(|| CodexxError::Config(format!("未找到 MCP: {id}")))?;
-        ensure_table(doc.as_table_mut(), "mcp_servers")?.insert(&id, json_to_toml_item(&db.2));
-        save_managed_mcp(&id, &db.1, &db.2, true)?;
+        let (name, config, _) =
+            stored.ok_or_else(|| CodexxError::Config(format!("未找到 MCP: {id}")))?;
+        ensure_table(doc.as_table_mut(), "mcp_servers")?.insert(&id, json_to_toml_item(&config));
+        save_managed_mcp_on_connection(&transaction, &id, &name, &config, true)?;
     } else {
-        if let Some(item) = doc
+        let live_config = doc
             .get("mcp_servers")
             .and_then(|m| m.as_table())
             .and_then(|tbl| tbl.get(&id))
-        {
-            let config = toml_item_to_json(item);
-            save_managed_mcp(&id, &id, &config, false)?;
+            .map(toml_item_to_json);
+        if let Some(config) = live_config {
+            let name = stored
+                .as_ref()
+                .map(|(name, _, _)| name.as_str())
+                .unwrap_or(&id);
+            save_managed_mcp_on_connection(&transaction, &id, name, &config, false)?;
+        } else if let Some((name, config, _)) = stored {
+            save_managed_mcp_on_connection(&transaction, &id, &name, &config, false)?;
         }
         if let Some(tbl) = doc.get_mut("mcp_servers").and_then(|m| m.as_table_mut()) {
             tbl.remove(&id);
         }
     }
-    write_text(&cfg, &doc.to_string())?;
+
+    let after = document_bytes(before.as_deref(), &doc);
+    commit_mcp_transaction_with_config(
+        transaction,
+        &codex_dir,
+        before,
+        after,
+        "toggle-mcp",
+        before_apply,
+        before_commit,
+    )?;
     build_skills_mcp_state_inner(config_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_case(name: &str) -> (PathBuf, String) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "codex-x-mcp-{name}-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create MCP test directory");
+        (dir, format!("test-mcp-{name}-{suffix}"))
+    }
+
+    fn database_error(error: rusqlite::Error) -> CodexxError {
+        CodexxError::Database(error.to_string())
+    }
+
+    fn remove_test_mcp(id: &str) {
+        open_db()
+            .expect("open test database")
+            .execute("DELETE FROM managed_mcp_servers WHERE id = ?1", [id])
+            .expect("remove test MCP");
+    }
+
+    #[test]
+    fn toggle_updates_only_the_target_mcp_and_keeps_database_in_sync() {
+        let _db_guard = crate::app_db::test_db_guard();
+        let (codex_dir, id) = test_case("success");
+        let cfg = config_path(&codex_dir);
+        let original = b"# keep this comment\nmodel = \"gpt-5.5\"\n\n[features]\njs_repl = false\n\n[mcp_servers.existing]\ncommand = \"existing\"\n";
+        fs::write(&cfg, original).expect("seed original config");
+        save_managed_mcp(&id, "Managed", &json!({ "command": "managed" }), false)
+            .expect("seed managed MCP");
+
+        let enabled_state =
+            toggle_codex_mcp_inner(Some(codex_dir.display().to_string()), id.clone(), true)
+                .expect("enable managed MCP");
+        assert!(enabled_state
+            .mcp_servers
+            .iter()
+            .any(|server| server.id == id && server.enabled));
+        let enabled_text = fs::read_to_string(&cfg).expect("read enabled config");
+        let enabled_doc = enabled_text
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse enabled config");
+        assert!(enabled_text.contains("# keep this comment"));
+        assert_eq!(enabled_doc["features"]["js_repl"].as_bool(), Some(false));
+        assert_eq!(
+            enabled_doc["mcp_servers"]["existing"]["command"].as_str(),
+            Some("existing")
+        );
+        assert_eq!(
+            enabled_doc["mcp_servers"][&id]["command"].as_str(),
+            Some("managed")
+        );
+        let conn = open_db().expect("open test database");
+        assert!(
+            managed_mcp_on_connection(&conn, &id)
+                .expect("read enabled MCP")
+                .expect("enabled MCP exists")
+                .2
+        );
+        drop(conn);
+
+        toggle_codex_mcp_inner(Some(codex_dir.display().to_string()), id.clone(), false)
+            .expect("disable managed MCP");
+        let disabled_text = fs::read_to_string(&cfg).expect("read disabled config");
+        let disabled_doc = disabled_text
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse disabled config");
+        assert!(disabled_text.contains("# keep this comment"));
+        assert!(disabled_doc["mcp_servers"].get(&id).is_none());
+        assert_eq!(
+            disabled_doc["mcp_servers"]["existing"]["command"].as_str(),
+            Some("existing")
+        );
+        let conn = open_db().expect("open test database");
+        let (name, config, enabled) = managed_mcp_on_connection(&conn, &id)
+            .expect("read disabled MCP")
+            .expect("disabled MCP exists");
+        assert_eq!(name, "Managed");
+        assert_eq!(config["command"].as_str(), Some("managed"));
+        assert!(!enabled);
+        drop(conn);
+        assert!(codex_dir.join(".codexx-test-backups").is_dir());
+
+        remove_test_mcp(&id);
+        fs::remove_dir_all(codex_dir).expect("remove MCP test directory");
+    }
+
+    #[test]
+    fn toggle_rejects_a_stale_snapshot_without_changing_database_or_external_config() {
+        let _db_guard = crate::app_db::test_db_guard();
+        let (codex_dir, id) = test_case("stale");
+        let cfg = config_path(&codex_dir);
+        let original = b"# original\nmodel = \"gpt-5.5\"\n";
+        let external = b"# external update\nmodel = \"gpt-5.5\"\n\n[mcp_servers.external]\ncommand = \"external\"\n";
+        fs::write(&cfg, original).expect("seed original config");
+        save_managed_mcp(&id, "Managed", &json!({ "command": "managed" }), false)
+            .expect("seed managed MCP");
+
+        let error = toggle_codex_mcp_with_hooks(
+            Some(codex_dir.display().to_string()),
+            id.clone(),
+            true,
+            |path| {
+                fs::write(path, external).map_err(|error| CodexxError::Config(error.to_string()))
+            },
+            |_| Ok(()),
+        )
+        .expect_err("stale MCP toggle must fail");
+
+        assert!(error.to_string().contains("已被其他程序修改"));
+        assert_eq!(fs::read(&cfg).expect("read external config"), external);
+        let conn = open_db().expect("open test database");
+        let (_, config, enabled) = managed_mcp_on_connection(&conn, &id)
+            .expect("read managed MCP")
+            .expect("managed MCP still exists");
+        assert_eq!(config["command"].as_str(), Some("managed"));
+        assert!(!enabled);
+        drop(conn);
+
+        remove_test_mcp(&id);
+        fs::remove_dir_all(codex_dir).expect("remove MCP test directory");
+    }
+
+    #[test]
+    fn toggle_rolls_back_config_when_database_commit_fails() {
+        let _db_guard = crate::app_db::test_db_guard();
+        let (codex_dir, id) = test_case("commit");
+        let cfg = config_path(&codex_dir);
+        let original = b"# keep exact bytes\nmodel = \"gpt-5.5\"\n\n[features]\njs_repl = false\n";
+        fs::write(&cfg, original).expect("seed original config");
+        save_managed_mcp(&id, "Managed", &json!({ "command": "managed" }), false)
+            .expect("seed managed MCP");
+
+        toggle_codex_mcp_with_hooks(
+            Some(codex_dir.display().to_string()),
+            id.clone(),
+            true,
+            |_| Ok(()),
+            |transaction| {
+                transaction
+                    .execute_batch("ROLLBACK")
+                    .map_err(database_error)
+            },
+        )
+        .expect_err("database commit failure must fail the toggle");
+
+        assert_eq!(fs::read(&cfg).expect("read rolled-back config"), original);
+        let conn = open_db().expect("open test database");
+        let (_, _, enabled) = managed_mcp_on_connection(&conn, &id)
+            .expect("read managed MCP")
+            .expect("managed MCP still exists");
+        assert!(!enabled);
+        drop(conn);
+        assert!(codex_dir.join(".codexx-test-backups").is_dir());
+
+        remove_test_mcp(&id);
+        fs::remove_dir_all(codex_dir).expect("remove MCP test directory");
+    }
+
+    #[test]
+    fn ccswitch_import_rolls_back_file_database_and_ids_when_commit_fails() {
+        let _db_guard = crate::app_db::test_db_guard();
+        let (codex_dir, id) = test_case("import-commit");
+        let second_id = format!("{id}-second");
+        let cfg = config_path(&codex_dir);
+        let original = b"# import baseline\nmodel = \"gpt-5.5\"\n";
+        fs::write(&cfg, original).expect("seed original config");
+        let mut imported_ids = HashSet::new();
+
+        import_ccswitch_mcp_candidates_with_hooks(
+            &codex_dir,
+            &mut imported_ids,
+            vec![
+                (
+                    id.clone(),
+                    "Imported".to_string(),
+                    json!({ "command": "imported" }),
+                    true,
+                ),
+                (
+                    second_id.clone(),
+                    "Imported second".to_string(),
+                    json!({ "command": "imported-second" }),
+                    true,
+                ),
+            ],
+            |_| Ok(()),
+            |transaction| {
+                transaction
+                    .execute_batch("ROLLBACK")
+                    .map_err(database_error)
+            },
+        )
+        .expect_err("database commit failure must fail the import");
+
+        assert_eq!(fs::read(&cfg).expect("read rolled-back config"), original);
+        assert!(imported_ids.is_empty());
+        let conn = open_db().expect("open test database");
+        assert!(managed_mcp_on_connection(&conn, &id)
+            .expect("read imported MCP")
+            .is_none());
+        assert!(managed_mcp_on_connection(&conn, &second_id)
+            .expect("read second imported MCP")
+            .is_none());
+        drop(conn);
+        assert!(codex_dir.join(".codexx-test-backups").is_dir());
+
+        fs::remove_dir_all(codex_dir).expect("remove MCP test directory");
+    }
 }

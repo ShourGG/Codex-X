@@ -1,10 +1,8 @@
-use crate::backups::{latest_backup, BackupEntry};
+use crate::backups::BackupEntry;
+#[cfg(test)]
 use crate::config_migration::migrate_legacy_prompt_config;
 use crate::error::Result;
-use crate::file_io::{
-    harden_sensitive_file_permissions, io_err, json_err, parse_toml_document,
-    read_to_string_if_exists,
-};
+use crate::file_io::{io_err, json_err, parse_toml_document, read_to_string_if_exists};
 use crate::prompts::{
     agents_path, managed_agents_template_key, prompt_template_key_for_instruction,
 };
@@ -175,6 +173,7 @@ pub(crate) fn active_saved_provider_id_from_config(
     (matches.len() == 1).then(|| matches[0].id.clone())
 }
 
+#[cfg(test)]
 pub(crate) fn build_state(codex_dir: PathBuf) -> Result<CodexState> {
     migrate_legacy_prompt_config(&codex_dir)?;
     build_state_after_migration(codex_dir)
@@ -183,8 +182,6 @@ pub(crate) fn build_state(codex_dir: PathBuf) -> Result<CodexState> {
 pub(crate) fn build_state_after_migration(codex_dir: PathBuf) -> Result<CodexState> {
     let cfg = config_path(&codex_dir);
     let auth = auth_path(&codex_dir);
-    harden_sensitive_file_permissions(&cfg)?;
-    harden_sensitive_file_permissions(&auth)?;
     let text = read_to_string_if_exists(&cfg)?;
     let doc = parse_toml_document(&cfg, &text)?;
     let model = string_value(&doc, "model");
@@ -236,6 +233,8 @@ pub(crate) fn build_state_after_migration(codex_dir: PathBuf) -> Result<CodexSta
         config_text: text,
         auth_preview: redacted_auth_preview(&auth)?,
         auth_text: read_to_string_if_exists(&auth)?,
-        last_backup: latest_backup()?,
+        // Backup discovery can traverse years of history. Keep core state fast;
+        // restore actions resolve history only when the user requests it.
+        last_backup: None,
     })
 }

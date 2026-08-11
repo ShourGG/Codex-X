@@ -82,7 +82,7 @@ use providers::{
     upsert_provider_on_connection, CcSwitchCodexRow, ProviderUpsertKind, ProviderUpsertMode,
 };
 use providers::{
-    capture_live_chatgpt_config, delete_saved_provider_inner, fetch_provider_models_inner,
+    build_provider_toml_draft_inner, delete_saved_provider_inner, fetch_provider_models_inner,
     get_official_config_draft_inner, import_ccswitch_codex_providers_inner,
     list_saved_providers_inner, read_ccswitch_official_auth_inner, reset_official_provider_inner,
     restore_official_provider_inner, save_active_provider_inner, save_official_config_inner,
@@ -115,9 +115,9 @@ use skills_mcp::{
 };
 #[cfg(test)]
 use state::active_saved_provider_id_from_config;
-use state::{
-    auth_has_material, build_state, build_state_after_migration, ActionResult, CodexState,
-};
+#[cfg(test)]
+use state::build_state;
+use state::{auth_has_material, build_state_after_migration, ActionResult, CodexState};
 use toml_edit::{value, DocumentMut};
 pub(crate) use toml_utils::string_value;
 use updates::check_app_update;
@@ -183,7 +183,7 @@ pub(crate) fn now_rfc3339() -> String {
 
 fn active_remote_builtin_prompt_id(config_dir: Option<String>) -> Option<String> {
     let codex_dir = resolve_codex_dir(config_dir).ok()?;
-    let state = build_state(codex_dir).ok()?;
+    let state = build_state_after_migration(codex_dir).ok()?;
     let template_key = state.instruction_template_key.as_deref()?;
     let id = template_key.strip_prefix("builtin:")?.trim();
     if id.is_empty() || bundled_prompt_meta(id).is_some() {
@@ -852,6 +852,18 @@ async fn list_saved_providers() -> Result<Vec<SavedProvider>> {
         .map_err(|e| CodexxError::Config(format!("读取供应商列表失败: {e}")))?
 }
 
+#[tauri::command]
+async fn build_provider_toml_draft(
+    provider: SavedProvider,
+    config_dir: Option<String>,
+) -> Result<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        build_provider_toml_draft_inner(provider, config_dir)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("生成供应商 TOML 失败: {e}")))?
+}
+
 fn save_provider_command_inner(provider: SavedProvider) -> Result<SavedProvider> {
     save_provider_inner(provider)
 }
@@ -889,12 +901,6 @@ async fn get_codex_state(config_dir: Option<String>) -> Result<CodexState> {
 
 fn get_codex_state_inner(config_dir: Option<String>) -> Result<CodexState> {
     let codex_dir = resolve_codex_dir(config_dir)?;
-    ensure_directory(&codex_dir)?;
-    let _live_lock = acquire_live_config_lock(&codex_dir)?;
-    migrate_legacy_prompt_config_locked(&codex_dir)?;
-    // Read-only refreshes only capture high-confidence ChatGPT credentials.
-    // Explicit provider switches also preserve official API-key configs.
-    capture_live_chatgpt_config(&codex_dir)?;
     build_state_after_migration(codex_dir)
 }
 
@@ -1350,6 +1356,7 @@ pub fn run() {
             delete_saved_prompt,
             enable_saved_prompt,
             list_saved_providers,
+            build_provider_toml_draft,
             save_provider,
             save_active_provider,
             delete_saved_provider,

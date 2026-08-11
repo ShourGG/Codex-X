@@ -426,6 +426,26 @@
   transform-origin: center top;
 }
 
+.cx-state-loading {
+  min-width: 0;
+  min-height: 280px;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--ui-text-muted);
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.cx-state-loading svg {
+  flex: 0 0 auto;
+  color: var(--ui-accent);
+}
+
 .cx-page-transition--exit,
 .cx-page-transition--enter {
   will-change: opacity, transform;

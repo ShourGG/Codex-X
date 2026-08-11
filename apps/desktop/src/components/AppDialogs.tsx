@@ -366,6 +366,7 @@ export function StartupWizardDialog({
           value={configDir || diagnostics.codexDir}
           onChange={(event) => onConfigDirChange(event.target.value)}
           placeholder="~/.codex"
+          disabled={loading}
           spellCheck={false}
         />
         <Button

@@ -4,7 +4,7 @@ use crate::{now_rfc3339, sanitize_id};
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use toml_edit::{value, DocumentMut, Item, Table};
+use toml_edit::{value, DocumentMut};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +35,7 @@ pub(crate) struct ProviderStoreRollback {
 
 const MANUAL_PROVIDER_SOURCE: &str = "manual";
 pub(crate) const CCSWITCH_PROVIDER_SOURCE: &str = "cc-switch";
+const CCSWITCH_LOCAL_PROVIDER_SOURCE: &str = "cc-switch-local";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ProviderIdentity {
@@ -165,25 +166,38 @@ pub(crate) fn provider_template_from_document(
     provider_id: &str,
     model: &str,
 ) -> Result<String> {
-    let mut provider_table = doc
+    let provider_exists = doc
         .get("model_providers")
         .and_then(|item| item.as_table())
         .and_then(|providers| providers.get(provider_id))
         .and_then(|item| item.as_table())
-        .cloned()
-        .ok_or_else(|| {
-            CodexxError::Config(format!("供应商 TOML 缺少 [model_providers.{provider_id}]"))
-        })?;
-    provider_table.remove("experimental_bearer_token");
+        .is_some();
+    if !provider_exists {
+        return Err(CodexxError::Config(format!(
+            "供应商 TOML 缺少 [model_providers.{provider_id}]"
+        )));
+    }
 
-    let mut template = DocumentMut::new();
+    let mut template = doc.clone();
     template["model_provider"] = value(provider_id);
     template["model"] = value(model);
-    let mut providers = Table::new();
-    providers.set_implicit(true);
-    providers.insert(provider_id, Item::Table(provider_table));
-    template["model_providers"] = Item::Table(providers);
+    strip_provider_bearer_tokens(&mut template);
     Ok(template.to_string().trim_end().to_string())
+}
+
+pub(crate) fn strip_provider_bearer_tokens(doc: &mut DocumentMut) {
+    doc.as_table_mut().remove("experimental_bearer_token");
+    let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_mut())
+    else {
+        return;
+    };
+    for (_, item) in providers.iter_mut() {
+        if let Some(table) = item.as_table_mut() {
+            table.remove("experimental_bearer_token");
+        }
+    }
 }
 
 fn same_provider_endpoint(left: &SavedProvider, right: &SavedProvider) -> bool {
@@ -464,7 +478,9 @@ fn update_stable_import(mut incoming: SavedProvider, existing: &SavedProvider) -
 }
 
 fn source_matches(row: &StoredProvider, origin: (&str, &str)) -> bool {
-    row.source == origin.0 && row.source_id.as_deref() == Some(origin.1)
+    let source_matches = row.source == origin.0
+        || (origin.0 == CCSWITCH_PROVIDER_SOURCE && row.source == CCSWITCH_LOCAL_PROVIDER_SOURCE);
+    source_matches && row.source_id.as_deref() == Some(origin.1)
 }
 
 fn source_can_merge(row: &StoredProvider, origin: Option<(&str, &str)>) -> bool {
@@ -547,11 +563,16 @@ fn upsert_provider_in_savepoint(
             .or(identity_match)
             .or(compatible_match),
     };
+    let preserves_local_profile = mode == ProviderUpsertMode::Imported
+        && target.is_some_and(|candidate| {
+            candidate.source == MANUAL_PROVIDER_SOURCE
+                || candidate.source == CCSWITCH_LOCAL_PROVIDER_SOURCE
+        });
     let kind = if let Some(target) = target {
         let existing = &target.provider;
         let same_id = existing.id == requested_id;
         provider.id = existing.id.clone();
-        if import_rehome_target.is_some() {
+        if preserves_local_profile {
             provider = preserve_existing_provider_config(provider, existing);
         } else if source_match.is_some_and(|candidate| candidate.provider.id == existing.id) {
             provider = update_stable_import(provider, existing);
@@ -578,7 +599,13 @@ fn upsert_provider_in_savepoint(
                 .map_err(|e| CodexxError::Database(e.to_string()))?;
         }
     }
-    write_provider_with_origin(conn, &provider, origin)?;
+    let write_origin = match origin {
+        Some((CCSWITCH_PROVIDER_SOURCE, source_id)) if preserves_local_profile => {
+            Some((CCSWITCH_LOCAL_PROVIDER_SOURCE, source_id))
+        }
+        _ => origin,
+    };
+    write_provider_with_origin(conn, &provider, write_origin)?;
     for duplicate_id in conflicting_provider_ids(&stored, &provider, origin) {
         conn.execute("DELETE FROM providers WHERE id = ?1", [&duplicate_id])
             .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -674,12 +701,20 @@ pub(crate) fn consolidate_legacy_provider_duplicates_on_connection(
             .collect::<Vec<_>>();
         let mut merged = 0usize;
         for mut group in duplicate_groups {
+            let preserves_local_profile = group.iter().any(|row| {
+                row.source == MANUAL_PROVIDER_SOURCE || row.source == CCSWITCH_LOCAL_PROVIDER_SOURCE
+            });
             let mut origins = group
                 .iter()
                 .filter_map(|row| {
-                    row.source_id
-                        .as_ref()
-                        .map(|source_id| (row.source.clone(), source_id.clone()))
+                    row.source_id.as_ref().map(|source_id| {
+                        let source = if row.source == CCSWITCH_LOCAL_PROVIDER_SOURCE {
+                            CCSWITCH_PROVIDER_SOURCE.to_string()
+                        } else {
+                            row.source.clone()
+                        };
+                        (source, source_id.clone())
+                    })
                 })
                 .collect::<Vec<_>>();
             origins.sort();
@@ -688,8 +723,16 @@ pub(crate) fn consolidate_legacy_provider_duplicates_on_connection(
                 continue;
             }
             group.sort_by(|left, right| {
-                is_historical_custom_provider_id(&left.provider.id)
-                    .cmp(&is_historical_custom_provider_id(&right.provider.id))
+                let left_is_local = left.source == MANUAL_PROVIDER_SOURCE
+                    || left.source == CCSWITCH_LOCAL_PROVIDER_SOURCE;
+                let right_is_local = right.source == MANUAL_PROVIDER_SOURCE
+                    || right.source == CCSWITCH_LOCAL_PROVIDER_SOURCE;
+                right_is_local
+                    .cmp(&left_is_local)
+                    .then_with(|| {
+                        is_historical_custom_provider_id(&left.provider.id)
+                            .cmp(&is_historical_custom_provider_id(&right.provider.id))
+                    })
                     .then_with(|| right.updated_at.cmp(&left.updated_at))
                     .then_with(|| right.created_at.cmp(&left.created_at))
                     .then_with(|| left.provider.id.cmp(&right.provider.id))
@@ -737,9 +780,14 @@ pub(crate) fn consolidate_legacy_provider_duplicates_on_connection(
                 .map_err(|e| CodexxError::Database(e.to_string()))?;
                 merged += 1;
             }
-            let origin = origins
-                .first()
-                .map(|(source, source_id)| (source.as_str(), source_id.as_str()));
+            let origin = origins.first().map(|(source, source_id)| {
+                let source = if preserves_local_profile && source == CCSWITCH_PROVIDER_SOURCE {
+                    CCSWITCH_LOCAL_PROVIDER_SOURCE
+                } else {
+                    source.as_str()
+                };
+                (source, source_id.as_str())
+            });
             write_provider_with_origin(conn, &survivor.provider, origin)?;
         }
 
@@ -1196,7 +1244,119 @@ mod tests {
         );
         let rows = stored_providers_on_connection(&conn).expect("read merged providers");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].source, CCSWITCH_PROVIDER_SOURCE);
+        assert_eq!(rows[0].source, CCSWITCH_LOCAL_PROVIDER_SOURCE);
+        assert_eq!(rows[0].source_id.as_deref(), Some("cc-row"));
+    }
+
+    #[test]
+    fn ccswitch_import_preserves_an_intentional_minimal_manual_template() {
+        let conn = test_connection();
+        let mut manual = provider("legacy-local", "Local name", Some("sk-shared"));
+        manual.model = "local-model".to_string();
+        manual.toml_config = Some(
+            r#"model_provider = "custom"
+model = "local-model"
+
+[model_providers.custom]
+name = "Local name"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+request_max_retries = 3
+"#
+            .to_string(),
+        );
+        upsert_provider_on_connection(&conn, manual, ProviderUpsertMode::Manual)
+            .expect("seed intentional minimal provider");
+
+        let mut imported = provider("cc-row", "CC name", Some("sk-shared"));
+        imported.model = "remote-model".to_string();
+        imported.toml_config = Some(
+            r#"# complete cc-switch template
+model_provider = "custom"
+model = "remote-model"
+service_tier = "priority"
+
+[model_providers.custom]
+name = "CC name"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+request_max_retries = 7
+
+[projects."/work/project"]
+trust_level = "trusted"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"#
+            .to_string(),
+        );
+        let result = upsert_ccswitch_provider_on_connection(&conn, imported, "cc-row")
+            .expect("merge cc-switch source without replacing the manual template");
+
+        assert_eq!(result.kind, ProviderUpsertKind::Merged);
+        assert_eq!(result.provider.id, "legacy-local");
+        assert_eq!(result.provider.provider_name, "Local name");
+        assert_eq!(result.provider.model, "local-model");
+        let template = result
+            .provider
+            .toml_config
+            .expect("preserved manual provider template");
+        let doc = template
+            .parse::<DocumentMut>()
+            .expect("parse preserved provider template");
+        assert!(!template.contains("# complete cc-switch template"));
+        assert!(doc.get("service_tier").is_none());
+        assert!(doc.get("projects").is_none());
+        assert!(doc.get("plugins").is_none());
+        assert_eq!(doc["model"].as_str(), Some("local-model"));
+        assert_eq!(
+            doc["model_providers"]["custom"]["name"].as_str(),
+            Some("Local name")
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
+            Some(3)
+        );
+
+        let mut repeated = provider("cc-row", "CC renamed", Some("sk-shared"));
+        repeated.model = "new-remote-model".to_string();
+        repeated.toml_config = Some(
+            r#"model_provider = "custom"
+model = "new-remote-model"
+service_tier = "flex"
+
+[model_providers.custom]
+name = "CC renamed"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+
+[projects."/remote/replacement"]
+trust_level = "untrusted"
+"#
+            .to_string(),
+        );
+        let repeated = upsert_ccswitch_provider_on_connection(&conn, repeated, "cc-row")
+            .expect("repeat cc-switch import without replacing local profile");
+        assert_eq!(repeated.provider.id, "legacy-local");
+        assert_eq!(repeated.provider.provider_name, "Local name");
+        assert_eq!(repeated.provider.model, "local-model");
+        let repeated_template = repeated.provider.toml_config.expect("keep local template");
+        let repeated_doc = repeated_template
+            .parse::<DocumentMut>()
+            .expect("parse repeated import template");
+        assert!(repeated_doc.get("service_tier").is_none());
+        assert!(repeated_doc.get("projects").is_none());
+        assert!(repeated_doc.get("plugins").is_none());
+        assert_eq!(
+            repeated_doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
+            Some(3)
+        );
+        let rows = stored_providers_on_connection(&conn).expect("read repeated import row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, CCSWITCH_LOCAL_PROVIDER_SOURCE);
         assert_eq!(rows[0].source_id.as_deref(), Some("cc-row"));
     }
 
@@ -1245,20 +1405,20 @@ mod tests {
     }
 
     #[test]
-    fn legacy_consolidation_transfers_one_external_source_to_the_latest_record() {
+    fn legacy_consolidation_keeps_the_local_profile_across_the_next_import() {
         let conn = test_connection();
         let mut imported = provider("imported-old", "Imported old", Some("sk-same"));
         imported.model = "old-model".to_string();
         write_provider_with_origin(&conn, &imported, Some((CCSWITCH_PROVIDER_SOURCE, "cc-row")))
             .unwrap();
-        let mut manual = provider("manual-latest", "Edited locally", Some("sk-same"));
+        let mut manual = provider("manual-local", "Edited locally", Some("sk-same"));
         manual.model = "latest-model".to_string();
         manual.toml_config = Some("model = \"latest-model\"".to_string());
         write_provider_on_connection(&conn, &manual).unwrap();
         conn.execute(
             "UPDATE providers SET updated_at = CASE id
-                WHEN 'imported-old' THEN '2026-01-01T00:00:00Z'
-                ELSE '2026-02-01T00:00:00Z' END",
+                WHEN 'imported-old' THEN '2026-02-01T00:00:00Z'
+                ELSE '2026-01-01T00:00:00Z' END",
             [],
         )
         .unwrap();
@@ -1269,14 +1429,32 @@ mod tests {
         );
         let rows = stored_providers_on_connection(&conn).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].provider.id, "manual-latest");
+        assert_eq!(rows[0].provider.id, "manual-local");
         assert_eq!(rows[0].provider.provider_name, "Edited locally");
         assert_eq!(rows[0].provider.model, "latest-model");
         assert_eq!(
             rows[0].provider.toml_config.as_deref(),
             Some("model = \"latest-model\"")
         );
-        assert_eq!(rows[0].source, CCSWITCH_PROVIDER_SOURCE);
+        assert_eq!(rows[0].source, CCSWITCH_LOCAL_PROVIDER_SOURCE);
+        assert_eq!(rows[0].source_id.as_deref(), Some("cc-row"));
+
+        let mut repeated = provider("imported-old", "Remote replacement", Some("sk-same"));
+        repeated.model = "remote-model".to_string();
+        repeated.toml_config = Some("model = \"remote-model\"".to_string());
+        upsert_ccswitch_provider_on_connection(&conn, repeated, "cc-row")
+            .expect("repeat import after legacy consolidation");
+
+        let rows = stored_providers_on_connection(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider.id, "manual-local");
+        assert_eq!(rows[0].provider.provider_name, "Edited locally");
+        assert_eq!(rows[0].provider.model, "latest-model");
+        assert_eq!(
+            rows[0].provider.toml_config.as_deref(),
+            Some("model = \"latest-model\"")
+        );
+        assert_eq!(rows[0].source, CCSWITCH_LOCAL_PROVIDER_SOURCE);
         assert_eq!(rows[0].source_id.as_deref(), Some("cc-row"));
     }
 
@@ -1330,6 +1508,7 @@ mod tests {
             r#"model_provider = "proxy"
 model = "stale-model"
 approval_policy = "never"
+experimental_bearer_token = "sk-top-level"
 
 [model_providers.proxy]
 name = "Stale Name"
@@ -1343,11 +1522,12 @@ request_max_retries = 7
 X-Route = "keep-me"
 
 [model_providers.unrelated]
-name = "Do not store"
+name = "Keep this provider"
 base_url = "https://unrelated.example.com/v1"
+experimental_bearer_token = "sk-unrelated"
 
 [mcp_servers.docs]
-command = "do-not-copy"
+command = "keep-this-command"
 "#
             .to_string(),
         );
@@ -1376,9 +1556,24 @@ command = "do-not-copy"
             doc["model_providers"]["proxy"]["http_headers"]["X-Route"].as_str(),
             Some("keep-me")
         );
-        assert!(doc.get("approval_policy").is_none());
-        assert!(doc["model_providers"].get("unrelated").is_none());
-        assert!(doc.get("mcp_servers").is_none());
+        assert_eq!(doc["model_provider"].as_str(), Some("proxy"));
+        assert_eq!(doc["approval_policy"].as_str(), Some("never"));
+        assert_eq!(
+            doc["model_providers"]["unrelated"]["name"].as_str(),
+            Some("Keep this provider")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["docs"]["command"].as_str(),
+            Some("keep-this-command")
+        );
+        assert!(doc.get("experimental_bearer_token").is_none());
+        assert!(doc["model_providers"]
+            .as_table()
+            .expect("model providers table")
+            .iter()
+            .all(|(_, item)| item
+                .as_table()
+                .is_none_or(|table| table.get("experimental_bearer_token").is_none())));
         assert!(!text.contains("experimental_bearer_token"));
         assert_eq!(normalized.api_key.as_deref(), Some("sk-explicit"));
     }

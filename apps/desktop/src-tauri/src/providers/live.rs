@@ -5,11 +5,11 @@ use super::official_auth::{
     official_config_candidate, official_snapshot_path, save_official_config_snapshot,
 };
 use super::{
-    delete_provider_inner, experimental_bearer_token_from_doc, is_placeholder_provider,
-    list_saved_providers_inner, list_saved_providers_on_connection,
+    custom_provider_id, delete_provider_inner, experimental_bearer_token_from_doc,
+    is_placeholder_provider, list_saved_providers_inner, list_saved_providers_on_connection,
     matching_saved_provider_ids_for_live, normalize_saved_provider, open_store,
     provider_template_from_document, reserved_codex_provider_id, rollback_provider_store_inner,
-    save_provider_with_rollback_inner, SavedProvider,
+    save_provider_with_rollback_inner, strip_provider_bearer_tokens, SavedProvider,
 };
 use crate::backups::create_backup;
 use crate::config_migration::migrate_legacy_prompt_config_locked;
@@ -323,13 +323,50 @@ pub(crate) fn detected_live_custom_provider(codex_dir: &Path) -> Result<Option<S
     }))
 }
 
-fn set_top_level_defaults(doc: &mut DocumentMut) {
-    if doc.get("model_reasoning_effort").is_none() {
-        doc["model_reasoning_effort"] = value("high");
+pub(crate) fn build_provider_toml_draft_inner(
+    mut provider: SavedProvider,
+    config_dir: Option<String>,
+) -> Result<String> {
+    if provider.id.trim().is_empty() {
+        provider.id = custom_provider_id(&provider.provider_name);
     }
-    if doc.get("disable_response_storage").is_none() {
-        doc["disable_response_storage"] = value(true);
-    }
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    let cfg = config_path(&codex_dir);
+    let saved_template = provider
+        .toml_config
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let base_text = match saved_template {
+        Some(text) => text.to_string(),
+        None => read_to_string_if_exists(&cfg)?,
+    };
+    let mut doc = parse_toml_document(&cfg, &base_text)?;
+    strip_provider_bearer_tokens(&mut doc);
+
+    let provider_id = saved_template
+        .and_then(|_| string_value(&doc, "model_provider"))
+        .filter(|id| {
+            doc.get("model_providers")
+                .and_then(|item| item.as_table())
+                .and_then(|providers| providers.get(id))
+                .and_then(|item| item.as_table())
+                .is_some()
+        })
+        .unwrap_or_else(|| "custom".to_string());
+    doc["model_provider"] = value(provider_id.clone());
+    doc["model"] = value(provider.model.trim());
+    let providers = ensure_table(doc.as_table_mut(), "model_providers")?;
+    let table = ensure_table(providers, &provider_id)?;
+    table["name"] = value(provider.provider_name.trim());
+    table["base_url"] = value(provider.base_url.trim().trim_end_matches('/'));
+    table["wire_api"] = value(provider.wire_api.trim());
+    table["requires_openai_auth"] = value(provider.requires_openai_auth);
+    provider.toml_config = Some(doc.to_string().trim_end().to_string());
+
+    normalize_saved_provider(provider)?
+        .toml_config
+        .ok_or_else(|| CodexxError::Config("无法生成供应商 TOML".to_string()))
 }
 
 fn set_provider_bearer_token(doc: &mut DocumentMut, token: &str) {
@@ -552,10 +589,7 @@ pub(crate) fn restore_official_provider_inner(config_dir: Option<String>) -> Res
         )
     })?;
     let model = candidate.model.clone();
-    let message = format!(
-        "已还原 OpenAI Official 独立配置，当前供应商未切换。认证来源：{}",
-        candidate.source
-    );
+    let message = "已还原 OpenAI Official 配置".to_string();
     let snapshot = update_official_snapshot(&codex_dir, || {
         save_official_config_snapshot(&codex_dir, model, &candidate.auth)
     })?;
@@ -663,7 +697,6 @@ fn merge_provider_toml_into_live(
     live["model_provider"] = value("custom");
     live["model"] = value(model);
     live.as_table_mut().remove("experimental_bearer_token");
-    set_top_level_defaults(&mut live);
     let providers = ensure_table(live.as_table_mut(), "model_providers")?;
     providers.remove("custom");
     providers.insert("custom", Item::Table(source_provider));
@@ -681,7 +714,7 @@ where
 {
     let cfg = config_path(codex_dir);
     let snapshot = capture_live_official_snapshot(codex_dir)?;
-    let prepared = (|| -> Result<(Option<String>, Vec<u8>)> {
+    let prepared = (|| -> Result<(Option<String>, Vec<u8>, String)> {
         pre_persist(codex_dir)?;
         let backup_id = create_backup(codex_dir, "save-provider-toml")?;
         let current_text = text_from_snapshot(&cfg, old_config.as_deref())?;
@@ -691,10 +724,21 @@ where
             input.config_text.trim_end(),
             input.api_key,
         )?;
+        let provider_name = doc
+            .get("model_providers")
+            .and_then(|item| item.as_table())
+            .and_then(|providers| providers.get("custom"))
+            .and_then(|item| item.as_table())
+            .and_then(|table| table.get("name"))
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("供应商");
+        let message = format!("已切换到 {provider_name}");
         let replacement = doc.to_string().trim_end().to_string() + "\n";
-        Ok((backup_id, replacement.into_bytes()))
+        Ok((backup_id, replacement.into_bytes(), message))
     })();
-    let (backup_id, replacement) = match prepared {
+    let (backup_id, replacement, message) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return rollback_after_failure(error, None, snapshot.as_ref()),
     };
@@ -702,13 +746,7 @@ where
         Ok(live) => live,
         Err(error) => return rollback_after_failure(error, None, snapshot.as_ref()),
     };
-    finish_live_action(
-        codex_dir,
-        "已保存供应商 TOML 配置".to_string(),
-        backup_id,
-        &live,
-        snapshot.as_ref(),
-    )
+    finish_live_action(codex_dir, message, backup_id, &live, snapshot.as_ref())
 }
 
 pub(crate) fn save_provider_toml_config_with_pre_persist<F>(
@@ -777,8 +815,6 @@ where
         doc["model_provider"] = value(live_provider_key);
         doc["model"] = value(model);
         doc.as_table_mut().remove("experimental_bearer_token");
-        set_top_level_defaults(&mut doc);
-
         let root = doc.as_table_mut();
         let providers = ensure_table(root, "model_providers")?;
         providers.remove(live_provider_key);
@@ -808,7 +844,7 @@ where
     };
     finish_live_action(
         codex_dir,
-        format!("已切换到 {provider_name} / {model}"),
+        format!("已切换到 {provider_name}"),
         backup_id,
         &live,
         snapshot.as_ref(),
@@ -1016,6 +1052,203 @@ requires_openai_auth = false
         assert!(error.to_string().contains("示例占位值"));
         assert!(!config_path(&codex_dir).exists());
         fs::remove_dir_all(codex_dir).expect("remove placeholder test directory");
+    }
+
+    #[test]
+    fn provider_template_switch_uses_latest_live_common_config() {
+        let current = r#"# keep-live-comment
+model_provider = "custom"
+model = "model-a"
+approval_policy = "never"
+service_tier = "priority"
+
+[model_providers.custom]
+name = "Provider A"
+base_url = "https://a.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-a"
+
+[features]
+js_repl = false
+
+[mcp_servers.live]
+command = "live-server"
+
+[projects."/live/project"]
+trust_level = "trusted"
+"#;
+        let historical_template = r#"model_provider = "saved-provider"
+model = "model-b"
+approval_policy = "on-request"
+service_tier = "flex"
+
+[model_providers.saved-provider]
+name = "Provider B"
+base_url = "https://b.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-stale-template"
+request_max_retries = 9
+
+[features]
+js_repl = true
+
+[mcp_servers.stale]
+command = "stale-server"
+
+[projects."/stale/project"]
+trust_level = "untrusted"
+"#;
+
+        let merged = merge_provider_toml_into_live(
+            Path::new("config.toml"),
+            current,
+            historical_template,
+            Some("sk-b".to_string()),
+        )
+        .expect("merge provider template");
+        let text = merged.to_string();
+
+        assert!(text.contains("# keep-live-comment"));
+        assert_eq!(merged["model_provider"].as_str(), Some("custom"));
+        assert_eq!(merged["model"].as_str(), Some("model-b"));
+        assert_eq!(merged["approval_policy"].as_str(), Some("never"));
+        assert_eq!(merged["service_tier"].as_str(), Some("priority"));
+        assert!(merged.get("model_reasoning_effort").is_none());
+        assert!(merged.get("disable_response_storage").is_none());
+        assert_eq!(merged["features"]["js_repl"].as_bool(), Some(false));
+        assert_eq!(
+            merged["mcp_servers"]["live"]["command"].as_str(),
+            Some("live-server")
+        );
+        assert!(merged["mcp_servers"].get("stale").is_none());
+        assert_eq!(
+            merged["projects"]["/live/project"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert!(merged["projects"].get("/stale/project").is_none());
+        assert_eq!(
+            merged["model_providers"]["custom"]["name"].as_str(),
+            Some("Provider B")
+        );
+        assert_eq!(
+            merged["model_providers"]["custom"]["request_max_retries"].as_integer(),
+            Some(9)
+        );
+        assert_eq!(
+            merged["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+            Some("sk-b")
+        );
+        assert!(!text.contains("sk-a"));
+        assert!(!text.contains("sk-stale-template"));
+    }
+
+    #[test]
+    fn provider_toml_draft_preserves_full_config_without_writing_live_files() {
+        let codex_dir = active_provider_test_dir("full-draft", 40_001);
+        let current = r#"# keep-draft-comment
+model_provider = "custom"
+model = "model-a"
+model_reasoning_effort = "xhigh"
+experimental_bearer_token = "sk-top-level"
+
+[model_providers.custom]
+name = "Provider A"
+base_url = "https://a.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-a"
+request_max_retries = 5
+
+[model_providers.other]
+name = "Other"
+base_url = "https://other.example.com/v1"
+experimental_bearer_token = "sk-other"
+
+[projects."/work/project"]
+trust_level = "trusted"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+
+[features]
+js_repl = false
+
+[mcp_servers.docs]
+command = "docs-server"
+"#;
+        let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"official-token"}}"#;
+        write_text(&config_path(&codex_dir), current).expect("write full live config");
+        fs::write(auth_path(&codex_dir), auth).expect("write live auth");
+        let config_before = fs::read(config_path(&codex_dir)).expect("snapshot config");
+        let auth_before = fs::read(auth_path(&codex_dir)).expect("snapshot auth");
+
+        let draft = build_provider_toml_draft_inner(
+            SavedProvider {
+                id: "provider-b".to_string(),
+                provider_name: "Provider B".to_string(),
+                base_url: "https://b.example.com/v1/".to_string(),
+                model: "model-b".to_string(),
+                api_key: Some("sk-b".to_string()),
+                toml_config: None,
+                wire_api: "responses".to_string(),
+                requires_openai_auth: false,
+            },
+            Some(codex_dir.display().to_string()),
+        )
+        .expect("build full provider TOML draft");
+        let doc = draft
+            .parse::<DocumentMut>()
+            .expect("parse full provider TOML draft");
+
+        assert_eq!(
+            fs::read(config_path(&codex_dir)).expect("read unchanged config"),
+            config_before
+        );
+        assert_eq!(
+            fs::read(auth_path(&codex_dir)).expect("read unchanged auth"),
+            auth_before
+        );
+        assert!(draft.contains("# keep-draft-comment"));
+        assert_eq!(doc["model"].as_str(), Some("model-b"));
+        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("xhigh"));
+        assert_eq!(
+            doc["model_providers"]["custom"]["name"].as_str(),
+            Some("Provider B")
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["base_url"].as_str(),
+            Some("https://b.example.com/v1")
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
+            Some(5)
+        );
+        assert_eq!(
+            doc["projects"]["/work/project"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            doc["plugins"]["browser@openai-bundled"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(doc["features"]["js_repl"].as_bool(), Some(false));
+        assert_eq!(
+            doc["mcp_servers"]["docs"]["command"].as_str(),
+            Some("docs-server")
+        );
+        assert!(doc.get("experimental_bearer_token").is_none());
+        assert!(doc["model_providers"]
+            .as_table()
+            .expect("model providers table")
+            .iter()
+            .all(|(_, item)| item
+                .as_table()
+                .is_none_or(|table| table.get("experimental_bearer_token").is_none())));
+        assert!(!draft.contains("sk-b"));
+
+        fs::remove_dir_all(codex_dir).expect("remove draft test directory");
     }
 
     fn write_active_provider_files(codex_dir: &Path, provider: &SavedProvider) -> Value {

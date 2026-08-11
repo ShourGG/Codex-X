@@ -1529,6 +1529,7 @@ fn switch_provider_scopes_api_key_and_preserves_official_auth() {
     })
     .expect("switch provider");
 
+    assert_eq!(result.message, "已切换到 MagicAI");
     assert_eq!(result.state.model_provider.as_deref(), Some("custom"));
     assert_eq!(result.state.model.as_deref(), Some("gpt-5.5"));
 
@@ -1583,7 +1584,9 @@ fn switch_provider_round_trip_restores_official_api_key() {
         .expect("resolve official snapshot path");
     let _ = fs::remove_file(&snapshot_path);
 
-    assert!(!capture_live_chatgpt_config(&codex_dir).expect("refresh official auth state"));
+    assert!(
+        !providers::capture_live_chatgpt_config(&codex_dir).expect("refresh official auth state")
+    );
     assert!(!snapshot_path.exists());
 
     switch_provider_inner(ProviderInput {
@@ -1667,21 +1670,16 @@ command = "docs-server"
     assert_eq!(provider_a.base_url, "https://a.example.com/v1");
     assert_eq!(provider_a.model, "model-a");
     assert_eq!(provider_a.api_key.as_deref(), Some("sk-a-scoped"));
-    assert!(!provider_a
-        .toml_config
-        .as_deref()
-        .unwrap_or_default()
-        .contains("experimental_bearer_token"));
-    assert!(!provider_a
-        .toml_config
-        .as_deref()
-        .unwrap_or_default()
-        .contains("approval_policy"));
-    assert!(!provider_a
-        .toml_config
-        .as_deref()
-        .unwrap_or_default()
-        .contains("mcp_servers"));
+    let provider_a_toml = provider_a.toml_config.as_deref().expect("provider A TOML");
+    let provider_a_doc = provider_a_toml
+        .parse::<DocumentMut>()
+        .expect("parse provider A TOML");
+    assert!(!provider_a_toml.contains("experimental_bearer_token"));
+    assert_eq!(provider_a_doc["approval_policy"].as_str(), Some("never"));
+    assert_eq!(
+        provider_a_doc["mcp_servers"]["docs"]["command"].as_str(),
+        Some("docs-server")
+    );
     assert_eq!(result.state.model.as_deref(), Some("model-b"));
     assert!(result
         .state
@@ -2091,9 +2089,13 @@ experimental_bearer_token = "sk-proxy"
 }
 
 #[test]
-fn state_refresh_propagates_official_snapshot_write_failure() {
-    let codex_dir = temp_codex_dir("state-snapshot-write-failure");
-    write_text(&config_path(&codex_dir), "model = \"gpt-5.5\"\n").expect("write config");
+fn state_refresh_is_strictly_read_only() {
+    let codex_dir = temp_codex_dir("state-refresh-read-only");
+    write_text(
+        &config_path(&codex_dir),
+        "# preserve-state-bytes\nmodel_provider = \"openai\"\nmodel = \"gpt-5.5\"\n",
+    )
+    .expect("write config");
     write_json(
         &auth_path(&codex_dir),
         &json!({
@@ -2102,18 +2104,113 @@ fn state_refresh_propagates_official_snapshot_write_failure() {
         }),
     )
     .expect("write official auth");
-    let snapshot = official_snapshot_path_for_test(&codex_dir).expect("resolve snapshot path");
-    if let Some(parent) = snapshot.parent() {
-        fs::create_dir_all(parent).expect("create snapshot parent");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(config_path(&codex_dir), fs::Permissions::from_mode(0o644))
+            .expect("set config test permissions");
+        fs::set_permissions(auth_path(&codex_dir), fs::Permissions::from_mode(0o640))
+            .expect("set auth test permissions");
     }
+    let snapshot = official_snapshot_path_for_test(&codex_dir).expect("resolve snapshot path");
     let _ = fs::remove_file(&snapshot);
-    fs::create_dir(&snapshot).expect("occupy snapshot path with directory");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot config bytes");
+    let auth_before = fs::read(auth_path(&codex_dir)).expect("snapshot auth bytes");
+    assert!(!snapshot.exists());
 
-    let error = get_codex_state_inner(Some(codex_dir.display().to_string()))
-        .expect_err("snapshot write failure must reach state caller");
+    let state = get_codex_state_inner(Some(codex_dir.display().to_string()))
+        .expect("read Codex state without writes");
 
-    assert!(error.to_string().contains(&snapshot.display().to_string()));
-    fs::remove_dir(&snapshot).expect("remove occupied snapshot path");
+    assert!(state.is_official_provider);
+    assert_eq!(state.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(
+        fs::read(config_path(&codex_dir)).expect("read unchanged config"),
+        config_before
+    );
+    assert_eq!(
+        fs::read(auth_path(&codex_dir)).expect("read unchanged auth"),
+        auth_before
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            fs::metadata(config_path(&codex_dir))
+                .expect("read config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(auth_path(&codex_dir))
+                .expect("read auth metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+    assert!(!snapshot.exists());
+
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn state_refresh_does_not_scan_historical_backups() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let codex_dir = temp_codex_dir("state-refresh-skips-backups");
+    write_text(
+        &config_path(&codex_dir),
+        r#"model_provider = "custom"
+model = "proxy-model"
+
+[model_providers.custom]
+name = "Proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+    )
+    .expect("write custom config");
+    let history = codex_dir.join(".codexx-test-backups");
+    fs::create_dir_all(&history).expect("create historical backup directory");
+    fs::set_permissions(&history, fs::Permissions::from_mode(0o000))
+        .expect("make historical backup directory unreadable");
+
+    let result = get_codex_state_inner(Some(codex_dir.display().to_string()));
+    fs::set_permissions(&history, fs::Permissions::from_mode(0o700))
+        .expect("restore historical backup permissions");
+    let state = result.expect("core state must not traverse historical backups");
+    assert!(!state.is_official_provider);
+    assert_eq!(state.model.as_deref(), Some("proxy-model"));
+
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn active_remote_prompt_lookup_does_not_migrate_legacy_config() {
+    let codex_dir = temp_codex_dir("active-remote-prompt-read-only");
+    write_text(
+        &config_path(&codex_dir),
+        "# keep-legacy-layout\n[tui]\nmodel_instructions_file = \"./remote.md\"\n",
+    )
+    .expect("write legacy prompt config");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot legacy config");
+
+    assert_eq!(
+        active_remote_builtin_prompt_id(Some(codex_dir.display().to_string())),
+        None
+    );
+
+    assert_eq!(
+        fs::read(config_path(&codex_dir)).expect("read unchanged legacy config"),
+        config_before
+    );
     let _ = fs::remove_dir_all(codex_dir);
 }
 
@@ -2151,6 +2248,7 @@ requires_openai_auth = true
     let result = restore_official_provider_inner(Some(codex_dir.display().to_string()))
         .expect("restore independent official config");
 
+    assert_eq!(result.message, "已还原 OpenAI Official 配置");
     assert_eq!(result.state.model_provider.as_deref(), Some("custom"));
     assert_eq!(result.state.model.as_deref(), Some("proxy-model"));
     assert!(result.backup_id.is_none());
@@ -2380,6 +2478,7 @@ requires_openai_auth = false
     .expect("save provider toml");
 
     assert!(result.ok);
+    assert_eq!(result.message, "已切换到 Proxy");
     let config_text = fs::read_to_string(config_path(&codex_dir)).expect("read config");
     assert!(config_text.contains("model_provider = \"custom\""));
     assert!(config_text.contains("[model_providers.custom]"));

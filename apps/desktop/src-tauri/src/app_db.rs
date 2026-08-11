@@ -3,8 +3,100 @@ use crate::file_io::ensure_directory;
 use crate::paths::app_home;
 use crate::sqlite_utils::table_column_set;
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+const APP_DB_SCHEMA_VERSION: i64 = 1;
+
+struct DatabaseInitializer {
+    migration_lock: Mutex<()>,
+}
+
+impl DatabaseInitializer {
+    fn new() -> Self {
+        Self {
+            migration_lock: Mutex::new(()),
+        }
+    }
+
+    fn open_at(&self, path: &Path) -> Result<Connection> {
+        self.open_at_with(path, initialize_schema)
+    }
+
+    fn open_at_with(
+        &self,
+        path: &Path,
+        initialize: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<Connection> {
+        if let Some(parent) = path.parent() {
+            ensure_directory(parent)?;
+        }
+        let conn = Connection::open(path).map_err(|e| CodexxError::Database(e.to_string()))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| CodexxError::Database(e.to_string()))?;
+
+        if schema_is_current(&conn)? {
+            return Ok(conn);
+        }
+
+        // Serialize first-time migrations inside this process. The persistent
+        // schema version also prevents repeated migrations across launches and
+        // detects a database replaced at the same path.
+        let _migration_guard = self
+            .migration_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !schema_is_current(&conn)? {
+            migrate_schema(&conn, initialize)?;
+        }
+        Ok(conn)
+    }
+}
+
+fn schema_version(conn: &Connection) -> Result<i64> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| CodexxError::Database(error.to_string()))
+}
+
+fn schema_is_current(conn: &Connection) -> Result<bool> {
+    Ok(schema_version(conn)? >= APP_DB_SCHEMA_VERSION)
+}
+
+fn migrate_schema(
+    conn: &Connection,
+    initialize: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+
+    let migration = (|| {
+        // Another Codex-X process may have completed the migration while this
+        // connection waited for SQLite's write lock.
+        if !schema_is_current(conn)? {
+            initialize(conn)?;
+            conn.pragma_update(None, "user_version", APP_DB_SCHEMA_VERSION)
+                .map_err(|error| CodexxError::Database(error.to_string()))?;
+        }
+        conn.execute_batch("COMMIT")
+            .map_err(|error| CodexxError::Database(error.to_string()))
+    })();
+
+    match migration {
+        Ok(()) => Ok(()),
+        Err(error) => match conn.execute_batch("ROLLBACK") {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(CodexxError::Database(format!(
+                "{error}; app database migration rollback failed: {rollback_error}"
+            ))),
+        },
+    }
+}
+
+fn database_initializer() -> &'static DatabaseInitializer {
+    static INITIALIZER: OnceLock<DatabaseInitializer> = OnceLock::new();
+    INITIALIZER.get_or_init(DatabaseInitializer::new)
+}
 
 #[cfg(test)]
 pub(crate) fn test_db_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -45,14 +137,7 @@ fn ensure_sqlite_column(
     }
 }
 
-pub(crate) fn open() -> Result<Connection> {
-    let path = db_path()?;
-    if let Some(parent) = path.parent() {
-        ensure_directory(parent)?;
-    }
-    let conn = Connection::open(&path).map_err(|e| CodexxError::Database(e.to_string()))?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(|e| CodexxError::Database(e.to_string()))?;
+fn initialize_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS providers (
             id TEXT PRIMARY KEY,
@@ -112,19 +197,19 @@ pub(crate) fn open() -> Result<Connection> {
     )
     .map_err(|e| CodexxError::Database(e.to_string()))?;
     ensure_sqlite_column(
-        &conn,
+        conn,
         "providers",
         "toml_config",
         "ALTER TABLE providers ADD COLUMN toml_config TEXT",
     )?;
     ensure_sqlite_column(
-        &conn,
+        conn,
         "providers",
         "source",
         "ALTER TABLE providers ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
     )?;
     ensure_sqlite_column(
-        &conn,
+        conn,
         "providers",
         "source_id",
         "ALTER TABLE providers ADD COLUMN source_id TEXT",
@@ -170,5 +255,183 @@ pub(crate) fn open() -> Result<Connection> {
         [],
     )
     .map_err(|e| CodexxError::Database(e.to_string()))?;
-    Ok(conn)
+    Ok(())
+}
+
+pub(crate) fn open() -> Result<Connection> {
+    database_initializer().open_at(&db_path()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    fn test_db_path(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "codex-x-app-db-{name}-{}-{suffix}",
+                std::process::id()
+            ))
+            .join("codexx.db")
+    }
+
+    fn remove_test_db(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::remove_dir_all(parent).expect("remove app database test directory");
+        }
+    }
+
+    #[test]
+    fn repeated_opens_do_not_rerun_legacy_cleanup() {
+        let path = test_db_path("cleanup-once");
+        let initializer = DatabaseInitializer::new();
+        let conn = initializer.open_at(&path).expect("initialize database");
+        conn.execute_batch(
+            "INSERT INTO prompts (id, title, filename, content, created_at, updated_at)
+             VALUES
+               ('kept', 'Kept', 'same.md', 'same', '1', '1'),
+               ('external-duplicate', 'Duplicate', 'same.md', 'same', '2', '2');",
+        )
+        .expect("seed a post-migration duplicate");
+        drop(conn);
+
+        let reopened_initializer = DatabaseInitializer::new();
+        let conn = reopened_initializer
+            .open_at(&path)
+            .expect("reopen database in a new process lifecycle");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prompts", [], |row| row.get(0))
+            .expect("count prompts after reopen");
+        assert_eq!(count, 2, "reopen must not rerun migration cleanup");
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn database_replaced_at_the_same_path_is_initialized_again() {
+        let path = test_db_path("replace-database");
+        let initializer = DatabaseInitializer::new();
+        let conn = initializer.open_at(&path).expect("initialize database");
+        assert_eq!(schema_version(&conn).expect("read schema version"), 1);
+        drop(conn);
+
+        fs::remove_file(&path).expect("replace initialized database");
+        let conn = initializer
+            .open_at(&path)
+            .expect("initialize replacement database");
+        let provider_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM providers", [], |row| row.get(0))
+            .expect("query replacement database schema");
+        assert_eq!(provider_count, 0);
+        assert_eq!(schema_version(&conn).expect("read replacement version"), 1);
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn concurrent_first_opens_initialize_once() {
+        let path = test_db_path("concurrent-init");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let path = path.clone();
+            // Separate initializers model independent Codex-X processes; the
+            // SQLite transaction and persistent version still permit one run.
+            let initializer = DatabaseInitializer::new();
+            let attempts = Arc::clone(&attempts);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                initializer.open_at_with(&path, |conn| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(25));
+                    conn.execute_batch("CREATE TABLE initialized_once (id INTEGER PRIMARY KEY);")
+                        .map_err(|error| CodexxError::Database(error.to_string()))
+                })
+            }));
+        }
+
+        barrier.wait();
+        for worker in workers {
+            drop(
+                worker
+                    .join()
+                    .expect("join concurrent database opener")
+                    .expect("open database concurrently"),
+            );
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn failed_initialization_can_retry() {
+        let path = test_db_path("retry-init");
+        let initializer = DatabaseInitializer::new();
+        let attempts = AtomicUsize::new(0);
+
+        let error = initializer
+            .open_at_with(&path, |_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(CodexxError::Database(
+                    "injected transient initialization failure".to_string(),
+                ))
+            })
+            .expect_err("first initialization must fail");
+        assert!(error
+            .to_string()
+            .contains("transient initialization failure"));
+
+        let conn = initializer
+            .open_at_with(&path, |conn| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                conn.execute_batch("CREATE TABLE retry_succeeded (id INTEGER PRIMARY KEY);")
+                    .map_err(|error| CodexxError::Database(error.to_string()))
+            })
+            .expect("retry initialization");
+        drop(conn);
+        let conn = initializer
+            .open_at_with(&path, |_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("open initialized database");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn initialized_read_connection_does_not_need_a_write_lock() {
+        let path = test_db_path("read-with-writer");
+        let initializer = DatabaseInitializer::new();
+        let writer = initializer.open_at(&path).expect("initialize database");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold database write reservation");
+
+        let reader = initializer
+            .open_at(&path)
+            .expect("open reader while write reservation is held");
+        let count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM providers", [], |row| row.get(0))
+            .expect("read while another connection holds write reservation");
+        assert_eq!(count, 0);
+
+        drop(reader);
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release write lock");
+        drop(writer);
+        remove_test_db(&path);
+    }
 }
