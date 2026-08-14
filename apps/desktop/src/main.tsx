@@ -107,10 +107,13 @@ const bundledInstructionTemplates: InstructionTemplate[] = [
   },
 ];
 
+const DEFAULT_RELAY_PROVIDER_NAME = "Shour Relay";
+const DEFAULT_RELAY_BASE_URL = "https://tk.shour.bond";
+
 const defaultProviderForm: SavedProvider = {
-  id: "magicai",
-  providerName: "MagicAI",
-  baseUrl: "https://sky1818.com",
+  id: "shour-relay",
+  providerName: DEFAULT_RELAY_PROVIDER_NAME,
+  baseUrl: DEFAULT_RELAY_BASE_URL,
   model: "gpt-5.5",
   apiKey: "",
   tomlConfig: "",
@@ -120,8 +123,8 @@ const defaultProviderForm: SavedProvider = {
 
 const blankProviderForm: SavedProvider = {
   id: "",
-  providerName: "",
-  baseUrl: "",
+  providerName: DEFAULT_RELAY_PROVIDER_NAME,
+  baseUrl: DEFAULT_RELAY_BASE_URL,
   model: "gpt-5.5",
   apiKey: "",
   tomlConfig: "",
